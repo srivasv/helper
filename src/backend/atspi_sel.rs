@@ -152,7 +152,15 @@ pub(super) async fn descend_for_focus(
         if *budget == 0 {
             break;
         }
-        if let Some(found) = Box::pin(descend_for_focus(conn, &child, depth + 1, max_depth, budget)).await {
+        if let Some(found) = Box::pin(descend_for_focus(
+            conn,
+            &child,
+            depth + 1,
+            max_depth,
+            budget,
+        ))
+        .await
+        {
             return Some(found);
         }
     }

@@ -52,7 +52,10 @@ pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
     }
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => return log::debug!("atspi_edit: runtime: {e}"),
         };
@@ -68,7 +71,11 @@ pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
                     "editedText": edited,
                     "contentObservationEndReason": reason,
                 }});
-                let _ = tx.send(proto::request("UpdateEditedText", payload, &format!("edit-{paste_id}")));
+                let _ = tx.send(proto::request(
+                    "UpdateEditedText",
+                    payload,
+                    &format!("edit-{paste_id}"),
+                ));
             }
             Ok(None) => {}
             Err(e) => log::debug!("atspi_edit: pasteId={paste_id} not observed: {e}"),
@@ -77,9 +84,15 @@ pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
 }
 
 /// `Ok(None)`: observation ended with nothing trustworthy to report.
-async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(String, &'static str)>, String> {
+async fn run(
+    paste_id: &str,
+    pasted: &str,
+    generation: u64,
+) -> Result<Option<(String, &'static str)>, String> {
     tokio::time::sleep(SETTLE).await;
-    let a11y = AccessibilityConnection::new().await.map_err(|e| format!("a11y connect: {e}"))?;
+    let a11y = AccessibilityConnection::new()
+        .await
+        .map_err(|e| format!("a11y connect: {e}"))?;
     let conn = a11y.connection();
 
     // Prefer the widget the focus tracker last saw; fall back to walking the active window.
@@ -87,7 +100,11 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
     let mut focused = None;
     if let Some(obj) = tracked {
         if let Ok(p) = obj.as_accessible_proxy(conn).await {
-            if p.get_state().await.map(|s| s.contains(State::Focused)).unwrap_or(false) {
+            if p.get_state()
+                .await
+                .map(|s| s.contains(State::Focused))
+                .unwrap_or(false)
+            {
                 focused = Some(obj);
             }
         }
@@ -108,8 +125,16 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
         .build()
         .await
         .map_err(|e| format!("no Text interface: {e}"))?;
-    let acc = focused.as_accessible_proxy(conn).await.map_err(|e| format!("accessible: {e}"))?;
-    if acc.get_role().await.map(|r| r == Role::PasswordText).unwrap_or(false) {
+    let acc = focused
+        .as_accessible_proxy(conn)
+        .await
+        .map_err(|e| format!("accessible: {e}"))?;
+    if acc
+        .get_role()
+        .await
+        .map(|r| r == Role::PasswordText)
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
 
@@ -118,7 +143,10 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
         if n > MAX_FIELD_CHARS {
             return Err("field too large".to_string());
         }
-        text.get_text(0, n).await.map(|s| s.chars().collect::<Vec<char>>()).map_err(|e| e.to_string())
+        text.get_text(0, n)
+            .await
+            .map(|s| s.chars().collect::<Vec<char>>())
+            .map_err(|e| e.to_string())
     };
 
     // The paste can land a beat after Ctrl+V (Chromium reads the clipboard async),
@@ -139,7 +167,11 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
     let (baseline, start) = found.ok_or("pasted text not found in field")?;
     let before = baseline[..start].to_vec();
     let after = baseline[start + pasted_chars.len()..].to_vec();
-    log::debug!("atspi_edit: pasteId={paste_id} observing (before={} after={})", before.len(), after.len());
+    log::debug!(
+        "atspi_edit: pasteId={paste_id} observing (before={} after={})",
+        before.len(),
+        after.len()
+    );
 
     let began = Instant::now();
     let mut last_change = Instant::now();
@@ -181,7 +213,9 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
         log::debug!("atspi_edit: pasteId={paste_id} anchors changed — not reporting");
         return Ok(None);
     }
-    let edited: String = current[before.len()..current.len() - after.len()].iter().collect();
+    let edited: String = current[before.len()..current.len() - after.len()]
+        .iter()
+        .collect();
     if edited.trim().is_empty() || edited.chars().count() > MAX_REPORT_CHARS {
         return Ok(None);
     }
@@ -192,13 +226,24 @@ async fn run(paste_id: &str, pasted: &str, generation: u64) -> Result<Option<(St
 /// Web content (Chromium/Electron) nests the field far deeper than the shared
 /// shallow walk used for selection reads reaches, so this one gets a larger
 /// depth/node budget — affordable because it runs off the paste path.
-async fn find_focused_in_active_window(conn: &zbus::Connection) -> Result<Option<atspi::ObjectRef>, String> {
+async fn find_focused_in_active_window(
+    conn: &zbus::Connection,
+) -> Result<Option<atspi::ObjectRef>, String> {
     let root = desktop_root(conn).await?;
     for app in root.get_children().await.unwrap_or_default() {
-        let Ok(app_proxy) = app.as_accessible_proxy(conn).await else { continue };
+        let Ok(app_proxy) = app.as_accessible_proxy(conn).await else {
+            continue;
+        };
         for win in app_proxy.get_children().await.unwrap_or_default() {
-            let Ok(win_proxy) = win.as_accessible_proxy(conn).await else { continue };
-            if !win_proxy.get_state().await.map(|s| s.contains(State::Active)).unwrap_or(false) {
+            let Ok(win_proxy) = win.as_accessible_proxy(conn).await else {
+                continue;
+            };
+            if !win_proxy
+                .get_state()
+                .await
+                .map(|s| s.contains(State::Active))
+                .unwrap_or(false)
+            {
                 continue;
             }
             let mut budget = WALK_NODES;
@@ -224,7 +269,9 @@ fn locate(hay: &[char], needle: &[char], caret: i32) -> Option<usize> {
             return Some(s);
         }
     }
-    (0..=hay.len() - n).rev().find(|&i| &hay[i..i + n] == needle)
+    (0..=hay.len() - n)
+        .rev()
+        .find(|&i| &hay[i..i + n] == needle)
 }
 
 #[cfg(test)]
