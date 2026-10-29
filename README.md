@@ -1,5 +1,12 @@
 # wispr-flow-linux-helper
 
+This fork publishes helper binaries independently for
+[srivasv/wispr-flow-linux](https://github.com/srivasv/wispr-flow-linux).
+Fork release tags use `v<version>-srivas.<revision>`; pushing a tag runs the
+existing x86_64/aarch64 release workflow with the glibc 2.35 compatibility check.
+Fixes are also submitted to [upstream](https://github.com/wispr-flow-linux/helper).
+
+
 > Standalone repo (`github.com/wispr-flow-linux/helper`), split out of the
 > `wispr-flow-linux` monorepo. Tagged `v*` releases publish prebuilt
 > `wispr-flow-linux-helper-x86_64` and `wispr-flow-linux-helper-aarch64`
