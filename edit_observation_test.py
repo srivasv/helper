@@ -2,6 +2,7 @@
 """Exercise GTK4 and Qt edit observation with focus events and bounded search."""
 
 import os
+import shutil
 import json
 from pathlib import Path
 import subprocess
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import time
 
-if len(sys.argv) == 2:
+if len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == "--qtquick"):
     messages = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
     binary = next(
         m["executable"]
@@ -35,7 +36,8 @@ if len(sys.argv) == 2:
         )
         for key in ("WAYLAND_DISPLAY", "AT_SPI_BUS_ADDRESS", "KDE_FULL_SESSION"):
             env.pop(key, None)
-        for toolkit in ("gtk4", "qt"):
+        toolkits = ("qtquick",) if "--qtquick" in sys.argv else ("gtk4", "qt")
+        for toolkit in toolkits:
             for focus_events in ("0", "1"):
                 env["WISPR_TEST_TOOLKIT"] = toolkit
                 env["WISPR_TEST_FOCUS_EVENTS"] = focus_events
@@ -57,7 +59,7 @@ if toolkit == "gtk4":
     assert int(version.split(".")[0]) >= 4, "This regression requires GTK4 Zenity"
     dialog_command = ["zenity", "--entry", "--title=Wispr edit regression",
                       "--text=Test field", "--entry-text=hello wisper world"]
-else:
+elif toolkit == "qt":
     dialog_command = ["kdialog", "--title", "Wispr edit regression",
                       "--inputbox", "Test field", "hello wisper world"]
 
@@ -68,6 +70,21 @@ def key(*args):
 
 with tempfile.TemporaryDirectory(prefix="wispr-gtk4-logs-") as logs:
     logs = Path(logs)
+    if toolkit == "qtquick":
+        qml = shutil.which("qml6") or shutil.which("qml")
+        assert qml, "Qt Quick testing requires a Qt 6 qml runtime"
+        fixture = logs / "field.qml"
+        fixture.write_text("""import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+ visible: true; width: 400; height: 160; title: "Wispr edit regression"
+ Column {
+  TextField { text: "hello wisper world"; focus: true; width: 350 }
+  Button { text: "Done" }
+ }
+}
+""")
+        dialog_command = [qml, str(fixture)]
     with open(logs / "zenity.log", "w") as log:
         zenity = subprocess.Popen(
             dialog_command,

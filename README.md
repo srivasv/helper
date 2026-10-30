@@ -197,3 +197,12 @@ It requires GTK4 Zenity and KDialog in addition to the dependencies above.
 cargo test --locked --no-run --message-format=json > /tmp/helper-tests.json
 /usr/bin/python3 edit_observation_test.py /tmp/helper-tests.json
 ```
+
+For Qt Quick fields (used by Plasma), install a Qt 6 `qml6`/`qml` runtime and
+Qt Quick Controls, then run the same event/fallback matrix:
+
+```bash
+/usr/bin/python3 edit_observation_test.py /tmp/helper-tests.json --qtquick
+```
+
+This validates a Qt Quick text field, not every Plasma widget or application.
