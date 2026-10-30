@@ -207,3 +207,31 @@ Qt Quick Controls, then run the same event/fallback matrix:
 ```
 
 This validates a Qt Quick text field, not every Plasma widget or application.
+
+Rich-text correction observation expands embedded objects through AT-SPI
+Hypertext links inside the focused editor. It never concatenates arbitrary
+children or follows link URLs. Plain fields retain caret-based matching;
+expanded fields require a unique dictated span. Passwords, nested editors,
+attachments, foreign objects and inconsistent snapshots are skipped. Snapshot
+reads have a two-second deadline, depth 16, 256 objects and 100,000 characters
+per pass; two consistent passes are required. Existing report and watch caps
+still apply. Lazy Chromium accessibility is activated by top-level metadata
+queries, without enabling a screen reader.
+
+The Chromium matrix uses a fresh profile, private Xvfb and private D-Bus for
+plain/rich text, paragraphs, formatting, Unicode, links, mentions, anchors,
+editor replacement and rejected private/ambiguous content. It covers focus
+events and discovery without a renderer-accessibility launch flag. Install
+Chromium (or Chrome) and the AT-SPI Python introspection bindings, then run:
+
+```bash
+CHROMIUM_BIN=/path/to/chromium /usr/bin/python3 \
+  edit_observation_test.py /tmp/helper-tests.json --chromium
+WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- \
+  cargo test rich_text_boundaries -- --ignored
+```
+
+The D-Bus fixture verifies safety checks before text reads, malformed links,
+cycles, changing identities, timeouts and resource limits. Real ChatGPT/Slack
+dictionary acceptance remains a separate manual check after installing a
+package containing this helper.

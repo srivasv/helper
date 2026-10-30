@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::ObjectRefExt;
-use atspi::proxy::text::TextProxy;
 use atspi::{Role, State};
 use serde_json::{json, Value};
 
@@ -35,8 +34,6 @@ const POLL: Duration = Duration::from_millis(400);
 const IDLE_END: Duration = Duration::from_secs(15);
 /// Never watch one paste longer than this.
 const MAX_WATCH: Duration = Duration::from_secs(120);
-/// Skip huge documents; the IPC frame cap is 30k and these aren't dictation fields.
-const MAX_FIELD_CHARS: i32 = 100_000;
 const WALK_TIMEOUT: Duration = Duration::from_secs(8);
 const WALK_DEPTH: usize = 40;
 const WALK_NODES: usize = 6_000;
@@ -132,14 +129,6 @@ async fn run(
         .map_err(|_| "focus walk timed out".to_string())??,
     };
     log::debug!("atspi_edit: focused {}{}", focused.name, focused.path);
-    let text = TextProxy::builder(conn)
-        .destination(focused.name.as_str())
-        .and_then(|b| b.path(focused.path.as_str()))
-        .map_err(|e| format!("text proxy: {e}"))?
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await
-        .map_err(|e| format!("no Text interface: {e}"))?;
     let acc = focused
         .as_accessible_proxy(conn)
         .await
@@ -148,35 +137,17 @@ async fn run(
         return Ok(None);
     }
 
-    let read = || async {
-        if !observable_role(acc.get_role().await.ok()) {
-            return Err("field role is unavailable or private".to_string());
-        }
-        let states = acc.get_state().await.map_err(|e| e.to_string())?;
-        if !states.contains(State::Focused) || !states.contains(State::Editable) {
-            return Err("field is not focused and editable".to_string());
-        }
-        let n = text.character_count().await.map_err(|e| e.to_string())?;
-        if !(0..=MAX_FIELD_CHARS).contains(&n) {
-            return Err("field too large".to_string());
-        }
-        text.get_text(0, n)
-            .await
-            .map(|s| s.chars().collect::<Vec<char>>())
-            .map_err(|e| e.to_string())
-    };
-
     // The paste can land a beat after Ctrl+V (Chromium reads the clipboard async),
     // so retry the baseline for a while before giving up.
     tokio::time::sleep(SETTLE).await;
     let pasted_chars: Vec<char> = pasted.chars().collect();
     let mut found = None;
     for attempt in 0..BASELINE_TRIES {
-        let baseline = read().await?;
-        let caret = text.caret_offset().await.unwrap_or(-1);
-        if let Some(start) = locate(&baseline, &pasted_chars, caret) {
-            found = Some((baseline, start));
-            break;
+        if let Ok(snapshot) = super::atspi_text::read(conn, &focused).await {
+            if let Some(start) = locate(&snapshot.chars, &pasted_chars, snapshot.caret) {
+                found = Some((snapshot.chars, start));
+                break;
+            }
         }
         if attempt + 1 < BASELINE_TRIES {
             tokio::time::sleep(POLL).await;
@@ -194,23 +165,31 @@ async fn run(
     let began = Instant::now();
     let mut last_change = Instant::now();
     let mut current = baseline;
+    let mut failed_reads = 0;
     let reason = loop {
         tokio::time::sleep(POLL).await;
         if GENERATION.load(Ordering::SeqCst) != generation {
             return Ok(None);
         }
-        let still_focused = acc
-            .get_state()
-            .await
-            .map(|s| s.contains(State::Focused))
-            .unwrap_or(false);
-        if !still_focused {
+        let states = match acc.get_state().await {
+            Ok(states) if !states.contains(State::Defunct) => states,
+            _ => return Ok(None),
+        };
+        if !states.contains(State::Focused) {
             break "focus_changed";
         }
-        let now = match read().await {
-            Ok(now) => now,
-            Err(_) => return Ok(None),
+        let now = match super::atspi_text::read(conn, &focused).await {
+            Ok(now) => now.chars,
+            Err(e) => {
+                log::debug!("atspi_edit: snapshot rejected: {e}");
+                failed_reads += 1;
+                if failed_reads >= 3 {
+                    return Ok(None);
+                }
+                continue;
+            }
         };
+        failed_reads = 0;
         if now != current {
             current = now;
             last_change = Instant::now();
@@ -272,6 +251,8 @@ async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::Obj
         let Ok(app_proxy) = app.as_accessible_proxy(conn).await else {
             continue;
         };
+        // Query only top-level metadata to activate lazy Chromium accessibility.
+        let _ = app_proxy.get_attributes().await;
         for win in app_proxy.get_children().await.unwrap_or_default() {
             let Ok(win_proxy) = win.as_accessible_proxy(conn).await else {
                 continue;
@@ -281,6 +262,7 @@ async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::Obj
                 .await
                 .map(|s| s.contains(State::Active))
                 .unwrap_or(false);
+            let _ = win_proxy.get_attributes().await;
             windows.push((active, win));
         }
     }
@@ -593,11 +575,27 @@ mod tests {
             generation,
             &GENERATION,
             Duration::from_secs(15),
-            run("gtk4-regression", "hello wisper world", generation),
+            run(
+                "toolkit-regression",
+                &std::env::var("WISPR_TEST_PASTED").unwrap_or_else(|_| "hello wisper world".into()),
+                generation,
+            ),
         ));
-        assert_eq!(
-            result.unwrap().unwrap(),
-            Some(("hello whisper world".into(), "focus_changed"))
-        );
+        let result = result.expect("observer timed out");
+        if std::env::var("WISPR_TEST_REJECT").as_deref() == Ok("1") {
+            assert!(
+                !matches!(result, Ok(Some(_))),
+                "unsafe observation: {result:?}"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                Some((
+                    std::env::var("WISPR_TEST_EDITED")
+                        .unwrap_or_else(|_| "hello whisper world".into()),
+                    "focus_changed"
+                ))
+            );
+        }
     }
 }

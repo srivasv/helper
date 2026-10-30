@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "wispr-flow-linux-helper"
-version = "0.1.4-srivas.5"
+version = "0.1.4-srivas.6"
 dependencies = [
  "atspi",
  "env_logger",
