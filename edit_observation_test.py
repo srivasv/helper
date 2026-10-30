@@ -18,6 +18,30 @@ CHROMIUM_CASES = {
         "hello wisper world",
         "hello whisper world",
     ),
+    "omitted_space": (
+        "<p>before hello wisper world</p>",
+        "<p>before hello whisper world</p>",
+        "hello wisper world ",
+        "hello whisper world",
+    ),
+    "omitted_space_unchanged": (
+        "<p>hello wisper world</p>",
+        "<p>hello <b>wisper</b> world</p>",
+        "hello wisper world ",
+        "hello wisper world ",
+    ),
+    "omitted_space_ambiguous": (
+        "<p>hello wisper world, hello wisper world</p>",
+        "",
+        "hello wisper world ",
+        None,
+    ),
+    "omitted_newline": (
+        "<p>hello wisper world</p>",
+        "",
+        "hello wisper world\n",
+        None,
+    ),
     "textarea": (
         "hello wisper world",
         "hello whisper world",

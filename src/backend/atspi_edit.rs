@@ -144,8 +144,8 @@ async fn run(
     let mut found = None;
     for attempt in 0..BASELINE_TRIES {
         if let Ok(snapshot) = super::atspi_text::read(conn, &focused).await {
-            if let Some(start) = locate(&snapshot.chars, &pasted_chars, snapshot.caret) {
-                found = Some((snapshot.chars, start));
+            if let Some(span) = baseline_span(&snapshot.chars, &pasted_chars, snapshot.caret) {
+                found = Some((snapshot.chars, span));
                 break;
             }
         }
@@ -153,9 +153,10 @@ async fn run(
             tokio::time::sleep(POLL).await;
         }
     }
-    let (baseline, start) = found.ok_or("pasted text not found in field")?;
-    let before = baseline[..start].to_vec();
-    let after = baseline[start + pasted_chars.len()..].to_vec();
+    let (baseline, span) = found.ok_or("pasted text not found in field")?;
+    let before = baseline[..span.start].to_vec();
+    let after = baseline[span.end..].to_vec();
+    let observed = baseline[span].to_vec();
     log::debug!(
         "atspi_edit: pasteId={paste_id} observing (before={} after={})",
         before.len(),
@@ -202,7 +203,15 @@ async fn run(
         }
     };
 
-    Ok(edited_span(&current, &before, &after).map(|edited| (edited, reason)))
+    Ok(edited_span(&current, &before, &after).map(|edited| {
+        // Presentation-only omission must not become a reported correction.
+        let edited = if edited.chars().eq(observed.iter().copied()) {
+            pasted.to_owned()
+        } else {
+            edited
+        };
+        (edited, reason)
+    }))
 }
 
 // A stalled provider must not retain a watcher after another paste or the cap.
@@ -321,6 +330,23 @@ fn observable_role(role: Option<Role>) -> bool {
     matches!(role, Some(r) if r != Role::PasswordText && r != Role::Terminal)
 }
 
+/// Exact matches win. Only a unique field-ending phrase without a usable caret
+/// may omit trailing ASCII spaces; never normalize newlines or interior text.
+fn baseline_span(hay: &[char], pasted: &[char], caret: i32) -> Option<std::ops::Range<usize>> {
+    if let Some(start) = locate(hay, pasted, caret) {
+        return Some(start..start + pasted.len());
+    }
+    if caret >= 0 || pasted.is_empty() || hay.windows(pasted.len()).any(|s| s == pasted) {
+        return None;
+    }
+    let end = pasted.iter().rposition(|c| *c != ' ')? + 1;
+    if end == pasted.len() || pasted[..end].iter().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    let start = locate(hay, &pasted[..end], -1)?;
+    (start + end == hay.len()).then_some(start..hay.len())
+}
+
 /// Char offset of `needle` in `hay`: the occurrence ending at the caret if the
 /// toolkit reports one (a paste leaves the caret right after the text), otherwise
 /// require a unique occurrence. Ambiguous text is not safe to auto-learn from.
@@ -348,6 +374,43 @@ mod tests {
 
     fn c(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    #[test]
+    fn baseline_accepts_only_unique_field_ending_omitted_spaces() {
+        assert_eq!(
+            baseline_span(&c("before 日本 🦀"), &c("日本 🦀  "), -1),
+            Some(7..11)
+        );
+        assert_eq!(baseline_span(&c("hi "), &c("hi "), 3), Some(0..3));
+        assert_eq!(baseline_span(&c("hi hi "), &c("hi "), -1), None);
+        assert_eq!(baseline_span(&c("hi, hi"), &c("hi "), -1), None);
+        assert_eq!(baseline_span(&c("hi later"), &c("hi "), -1), Some(0..3));
+        assert_eq!(baseline_span(&c("hi, later"), &c("hi "), -1), None);
+        assert_eq!(baseline_span(&c("hi"), &c("hi "), 0), None);
+        assert_eq!(baseline_span(&c("hi"), &c("hi "), 2), None);
+        assert_eq!(baseline_span(&c("hi"), &c(" hi "), -1), None);
+        assert_eq!(baseline_span(&c("hi"), &c("hi\n"), -1), None);
+        assert_eq!(baseline_span(&c("hi"), &c("hi\t"), -1), None);
+        assert_eq!(baseline_span(&c("hi"), &c("hi\u{a0}"), -1), None);
+        assert_eq!(baseline_span(&c("a b"), &c("a  b "), -1), None);
+        assert_eq!(baseline_span(&c("hi "), &c("hi  "), -1), None);
+        assert_eq!(baseline_span(&c(""), &c(""), -1), None);
+        assert_eq!(baseline_span(&c(""), &c("   "), -1), None);
+        assert_eq!(baseline_span(&c("\n"), &c("\n "), -1), None);
+    }
+
+    #[test]
+    fn shortened_baseline_keeps_anchors_in_character_offsets() {
+        let baseline = c("before 日本 🦀");
+        let span = baseline_span(&baseline, &c("日本 🦀 "), -1).unwrap();
+        let before = &baseline[..span.start];
+        let after = &baseline[span.end..];
+        assert_eq!(
+            edited_span(&c("before 日本語 🦀"), before, after),
+            Some("日本語 🦀".into())
+        );
+        assert_eq!(edited_span(&c("changed 日本語 🦀"), before, after), None);
     }
 
     #[test]
