@@ -12,6 +12,12 @@ import tempfile
 import time
 
 CHROMIUM_CASES = {
+    "deep_editor": (
+        "<p>hello wisper world</p>",
+        "<p>hello whisper world</p>",
+        "hello wisper world",
+        "hello whisper world",
+    ),
     "paragraph": (
         "<p>hello wisper world</p>",
         "<p>hello whisper world</p>",
@@ -223,6 +229,8 @@ with tempfile.TemporaryDirectory(prefix="wispr-gtk4-logs-") as logs:
                 + before
                 + "</div>"
             )
+        if case == "deep_editor":
+            field = '<div role="group">' * 43 + field + "</div>" * 43
         fixture.write_text(
             '<!doctype html><meta charset="utf-8"><title>Wispr edit regression</title>'
             + field
