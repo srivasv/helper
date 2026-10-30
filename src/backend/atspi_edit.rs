@@ -118,10 +118,17 @@ async fn run(
     }
     let focused = match focused {
         Some(f) => f,
-        None => tokio::time::timeout(WALK_TIMEOUT, find_focused_field(conn))
-            .await
-            .map_err(|_| "focus walk timed out".to_string())??
-            .ok_or("no focused accessible")?,
+        None => tokio::time::timeout(WALK_TIMEOUT, async {
+            loop {
+                if let Some(field) = find_focused_field(conn).await? {
+                    break Ok::<_, String>(field);
+                }
+                // Toolkits register asynchronously when the a11y registry starts.
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .map_err(|_| "focus walk timed out".to_string())??,
     };
     log::debug!("atspi_edit: focused {}{}", focused.name, focused.path);
     let text = TextProxy::builder(conn)
