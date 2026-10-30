@@ -31,7 +31,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-gi gir1.2-gtk-3.0 at-spi2-core \
-            dbus-x11 xvfb xauth xdotool x11-utils xclip
+            dbus-x11 xvfb xauth xdotool x11-utils xclip zenity
       - run: cargo build --locked
       - name: Test paste shortcuts and post-paste edits over real IPC
         run: /usr/bin/python3 parity_test.py target/debug/wispr-flow-linux-helper
+      - name: Test GTK4 edits without an AT-SPI focus tracker
+        run: |
+          cargo test --locked --no-run --message-format=json > /tmp/helper-tests.json
+          /usr/bin/python3 gtk4_edit_test.py /tmp/helper-tests.json

@@ -118,10 +118,17 @@ async fn run(
     }
     let focused = match focused {
         Some(f) => f,
-        None => tokio::time::timeout(WALK_TIMEOUT, find_focused_in_active_window(conn))
-            .await
-            .map_err(|_| "focus walk timed out".to_string())??
-            .ok_or("no focused accessible")?,
+        None => tokio::time::timeout(WALK_TIMEOUT, async {
+            loop {
+                if let Some(field) = find_focused_field(conn).await? {
+                    break Ok::<_, String>(field);
+                }
+                // Toolkits register asynchronously when the a11y registry starts.
+                tokio::time::sleep(POLL).await;
+            }
+        })
+        .await
+        .map_err(|_| "focus walk timed out".to_string())??,
     };
     log::debug!("atspi_edit: focused {}{}", focused.name, focused.path);
     let text = TextProxy::builder(conn)
@@ -253,14 +260,13 @@ fn edited_span(current: &[char], before: &[char], after: &[char]) -> Option<Stri
     (!edited.trim().is_empty()).then_some(edited)
 }
 
-/// Locate the focused field by descending only the active top-level window(s).
+/// Locate the focused field, preferring active windows without requiring that flag.
 /// Web content (Chromium/Electron) nests the field far deeper than the shared
 /// shallow walk used for selection reads reaches, so this one gets a larger
 /// depth/node budget — affordable because it runs off the paste path.
-async fn find_focused_in_active_window(
-    conn: &zbus::Connection,
-) -> Result<Option<atspi::ObjectRef>, String> {
+async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::ObjectRef>, String> {
     let root = desktop_root(conn).await?;
+    let mut windows = Vec::new();
     for app in root.get_children().await.unwrap_or_default() {
         let Ok(app_proxy) = app.as_accessible_proxy(conn).await else {
             continue;
@@ -269,18 +275,23 @@ async fn find_focused_in_active_window(
             let Ok(win_proxy) = win.as_accessible_proxy(conn).await else {
                 continue;
             };
-            if !win_proxy
+            let active = win_proxy
                 .get_state()
                 .await
                 .map(|s| s.contains(State::Active))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let mut budget = WALK_NODES;
-            if let Some(f) = descend_for_focus(conn, &win, 0, WALK_DEPTH, &mut budget).await {
-                return Ok(Some(f));
-            }
+                .unwrap_or(false);
+            windows.push((active, win));
+        }
+    }
+    // GTK4 dialogs can expose a focused field without an Active parent.
+    windows.sort_by_key(|(active, _)| !active);
+    let mut budget = WALK_NODES;
+    for (_, win) in windows {
+        if let Some(f) = descend_for_focus(conn, &win, 0, WALK_DEPTH, &mut budget).await {
+            return Ok(Some(f));
+        }
+        if budget == 0 {
+            break;
         }
     }
     Ok(None)
@@ -422,5 +433,26 @@ mod tests {
         watch(String::new(), "next paste".into(), tx);
         assert_eq!(GENERATION.load(Ordering::SeqCst), previous + 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires gtk4_edit_test.py's isolated Zenity fixture"]
+    fn gtk4_observation_without_focus_tracker() {
+        assert_eq!(
+            std::env::var("WISPR_GTK4_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        let _ = env_logger::try_init();
+        let generation = GENERATION.load(Ordering::SeqCst);
+        let result = runtime().block_on(until_cancelled(
+            generation,
+            &GENERATION,
+            Duration::from_secs(15),
+            run("gtk4-regression", "hello wisper world", generation),
+        ));
+        assert_eq!(
+            result.unwrap().unwrap(),
+            Some(("hello whisper world".into(), "focus_changed"))
+        );
     }
 }
