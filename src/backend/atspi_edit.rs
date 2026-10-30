@@ -254,7 +254,9 @@ fn edited_span(current: &[char], before: &[char], after: &[char]) -> Option<Stri
 /// Web content (Chromium/Electron) nests the field far deeper than the shared
 /// shallow walk used for selection reads reaches, so this one gets a larger
 /// depth/node budget — affordable because it runs off the paste path.
-async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::ObjectRef>, String> {
+pub(super) async fn find_focused_field(
+    conn: &zbus::Connection,
+) -> Result<Option<atspi::ObjectRef>, String> {
     let root = desktop_root(conn).await?;
     let mut windows = Vec::new();
     for app in root.get_children().await.unwrap_or_default() {

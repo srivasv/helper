@@ -235,3 +235,22 @@ The D-Bus fixture verifies safety checks before text reads, malformed links,
 cycles, changing identities, timeouts and resource limits. Real ChatGPT/Slack
 dictionary acceptance remains a separate manual check after installing a
 package containing this helper.
+
+### Embedded terminals and selected text
+
+Paste uses Ctrl+Shift+V for terminal apps and focused terminal widgets, including
+VS Code's xterm.js textarea; ordinary editor fields keep Ctrl+V. Embedded terminal
+detection requires accessibility data and an active ancestor window. If the
+probe times out (800 ms), paste keeps the default shortcut or explicit override.
+
+Selection reads use tracked focus or the deep active-window editor search before
+falling back to copy. The AT-SPI 0.22 Text proxy spells `GetNSelections` incorrectly
+on the wire, so the helper calls that exact D-Bus method directly. The selection
+probe has a two-second budget, including tree discovery.
+
+Run the isolated protocol and deep-editor regression without touching the desktop:
+
+```bash
+WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- \
+  cargo test selection_discovers_deep_active_editor -- --ignored
+```
