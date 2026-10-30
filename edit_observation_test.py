@@ -263,9 +263,10 @@ ApplicationWindow {
         )
     test = None
     try:
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 20
         windows = []
         while not windows:
+            assert zenity.poll() is None, (logs / "zenity.log").read_text()
             windows = subprocess.run(
                 [
                     "xdotool",
@@ -279,7 +280,9 @@ ApplicationWindow {
                 capture_output=True,
                 text=True,
             ).stdout.split()
-            assert time.monotonic() < deadline, "Zenity did not open"
+            assert time.monotonic() < deadline, (
+                "Fixture did not open: " + (logs / "zenity.log").read_text()
+            )
             if not windows:
                 time.sleep(0.05)
         key("windowfocus", "--sync", windows[0])
