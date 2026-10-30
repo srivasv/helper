@@ -6,7 +6,8 @@
 //!      (`ctrl+v` or `ctrl+shift+v`). Always wins when set.
 //!   2. Per-app detection — the request dispatcher inspects the
 //!      focused app right before delegating the paste and records whether it
-//!      is a terminal emulator. Terminals get Ctrl+Shift+V (their paste
+//!      is a terminal emulator or contains a focused terminal widget.
+//!      Terminals get Ctrl+Shift+V (their paste
 //!      binding; Ctrl+V is literal-insert in shells), everything else keeps
 //!      the stock Ctrl+V so non-terminal apps see zero behavior change.
 
