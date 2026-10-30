@@ -30,7 +30,7 @@ jobs:
       - name: Install isolated integration test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gtk-3.0 at-spi2-core \
+          sudo apt-get install -y python3-gi gir1.2-atspi-2.0 gir1.2-gtk-3.0 at-spi2-core \
             dbus-x11 xvfb xauth xdotool x11-utils xclip zenity kdialog
       - run: cargo build --locked
       - name: Test paste shortcuts and post-paste edits over real IPC
@@ -39,3 +39,9 @@ jobs:
         run: |
           cargo test --locked --no-run --message-format=json > /tmp/helper-tests.json
           /usr/bin/python3 edit_observation_test.py /tmp/helper-tests.json
+      - name: Test rich-text privacy and resource boundaries
+        run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test rich_text_boundaries -- --ignored
+      - name: Test Chromium rich-text edits with events and lazy accessibility
+        run: |
+          CHROMIUM_BIN="$(command -v google-chrome)" /usr/bin/python3 \
+            edit_observation_test.py /tmp/helper-tests.json --chromium
