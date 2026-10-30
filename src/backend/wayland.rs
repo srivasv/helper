@@ -102,12 +102,12 @@ impl WaylandBackend {
 
 impl Backend for WaylandBackend {
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        let chord = paste::chord()?;
         // Offer text/plain (+ text/html when supplied), like the Windows helper's
         // dual-format clipboard, then synthesize the configured paste chord.
         self.clipboard_set_rich(text, html)?;
         // Let the new selection owner register before the paste chord reads it.
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let chord = paste::chord()?;
         let key = keymap::vk_to_evdev(chord.key_vk)
             .ok_or_else(|| format!("unmapped paste key VK {}", chord.key_vk))?;
         let mods: Vec<u16> = chord

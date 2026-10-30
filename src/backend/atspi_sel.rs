@@ -106,7 +106,7 @@ pub(super) async fn desktop_root(conn: &Connection) -> Result<AccessibleProxy<'s
 /// are the desktop's direct children; we descend each looking for the node whose
 /// state set contains `Focused`. Bounded by depth/node count so a misbehaving
 /// provider can't make us walk forever.
-pub(super) async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
+async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
     let root = desktop_root(conn).await?;
     let apps = root.get_children().await.unwrap_or_default();
 

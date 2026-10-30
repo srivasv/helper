@@ -236,12 +236,12 @@ impl X11Backend {
 
 impl Backend for X11Backend {
     fn paste_text(&mut self, text: &str, _html: Option<&str>) -> Result<()> {
+        let chord = paste::chord()?;
         // Clipboard-based paste: set clipboard, synthesize the configured paste chord.
         // TODO: save & restore the user's prior clipboard around the paste; offer text/html.
         self.clipboard_set(text)?;
         // brief settle so the new owner is registered before the paste chord reads it
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let chord = paste::chord()?;
         let key_keysym = keymap::vk_to_keysym(chord.key_vk)
             .ok_or_else(|| format!("unmapped paste key VK {}", chord.key_vk))?;
         let mods: Vec<u32> = chord

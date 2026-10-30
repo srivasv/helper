@@ -42,15 +42,15 @@ const WALK_DEPTH: usize = 40;
 const WALK_NODES: usize = 6_000;
 const MAX_REPORT_CHARS: usize = 8_000;
 
-/// Bumped by every new paste so the previous watcher ends ("superseded").
+/// Bumped by every successful paste so superseded observations are discarded.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Start observing the field the paste just went into. Returns immediately.
 pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     if paste_id.is_empty() || pasted.trim().is_empty() {
         return;
     }
-    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -59,8 +59,13 @@ pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
             Ok(rt) => rt,
             Err(e) => return log::debug!("atspi_edit: runtime: {e}"),
         };
-        match rt.block_on(run(&paste_id, &pasted, generation)) {
-            Ok(Some((edited, reason))) => {
+        match rt.block_on(until_cancelled(
+            generation,
+            &GENERATION,
+            MAX_WATCH + WALK_TIMEOUT + SETTLE,
+            run(&paste_id, &pasted, generation),
+        )) {
+            Some(Ok(Some((edited, reason)))) => {
                 log::info!(
                     "atspi_edit: pasteId={paste_id} end={reason} changed={}",
                     edited != pasted
@@ -71,14 +76,15 @@ pub fn watch(paste_id: String, pasted: String, tx: Sender<Value>) {
                     "editedText": edited,
                     "contentObservationEndReason": reason,
                 }});
-                let _ = tx.send(proto::request(
-                    "UpdateEditedText",
-                    payload,
-                    &format!("edit-{paste_id}"),
-                ));
+                let report =
+                    proto::request("UpdateEditedText", payload, &format!("edit-{paste_id}"));
+                if GENERATION.load(Ordering::SeqCst) == generation && proto::encode(&report).is_ok()
+                {
+                    let _ = tx.send(report);
+                }
             }
-            Ok(None) => {}
-            Err(e) => log::debug!("atspi_edit: pasteId={paste_id} not observed: {e}"),
+            Some(Err(e)) => log::debug!("atspi_edit: pasteId={paste_id} not observed: {e}"),
+            _ => {}
         }
     });
 }
@@ -89,7 +95,8 @@ async fn run(
     pasted: &str,
     generation: u64,
 ) -> Result<Option<(String, &'static str)>, String> {
-    tokio::time::sleep(SETTLE).await;
+    // GNOME/KWin identity providers do not start the AT-SPI focus tracker.
+    let _ = atspi::connection::set_session_accessibility(true).await;
     let a11y = AccessibilityConnection::new()
         .await
         .map_err(|e| format!("a11y connect: {e}"))?;
@@ -129,18 +136,20 @@ async fn run(
         .as_accessible_proxy(conn)
         .await
         .map_err(|e| format!("accessible: {e}"))?;
-    if acc
-        .get_role()
-        .await
-        .map(|r| r == Role::PasswordText)
-        .unwrap_or(false)
-    {
+    if !observable_role(acc.get_role().await.ok()) {
         return Ok(None);
     }
 
     let read = || async {
+        if !observable_role(acc.get_role().await.ok()) {
+            return Err("field role is unavailable or private".to_string());
+        }
+        let states = acc.get_state().await.map_err(|e| e.to_string())?;
+        if !states.contains(State::Focused) || !states.contains(State::Editable) {
+            return Err("field is not focused and editable".to_string());
+        }
         let n = text.character_count().await.map_err(|e| e.to_string())?;
-        if n > MAX_FIELD_CHARS {
+        if !(0..=MAX_FIELD_CHARS).contains(&n) {
             return Err("field too large".to_string());
         }
         text.get_text(0, n)
@@ -151,6 +160,7 @@ async fn run(
 
     // The paste can land a beat after Ctrl+V (Chromium reads the clipboard async),
     // so retry the baseline for a while before giving up.
+    tokio::time::sleep(SETTLE).await;
     let pasted_chars: Vec<char> = pasted.chars().collect();
     let mut found = None;
     for attempt in 0..BASELINE_TRIES {
@@ -179,22 +189,23 @@ async fn run(
     let reason = loop {
         tokio::time::sleep(POLL).await;
         if GENERATION.load(Ordering::SeqCst) != generation {
-            break "superseded";
+            return Ok(None);
         }
-        if let Ok(now) = read().await {
-            if now != current {
-                current = now;
-                last_change = Instant::now();
-            }
-        } else {
-            break "focus_changed";
-        }
-        let still_focused = match acc.get_state().await {
-            Ok(s) => s.contains(State::Focused),
-            Err(_) => false,
-        };
+        let still_focused = acc
+            .get_state()
+            .await
+            .map(|s| s.contains(State::Focused))
+            .unwrap_or(false);
         if !still_focused {
             break "focus_changed";
+        }
+        let now = match read().await {
+            Ok(now) => now,
+            Err(_) => return Ok(None),
+        };
+        if now != current {
+            current = now;
+            last_change = Instant::now();
         }
         if last_change.elapsed() >= IDLE_END {
             break "idle_timeout";
@@ -204,22 +215,42 @@ async fn run(
         }
     };
 
-    // The edit region is what sits between the unchanged text around the paste.
-    // If either anchor was damaged we can't tell paste edits from other edits.
+    Ok(edited_span(&current, &before, &after).map(|edited| (edited, reason)))
+}
+
+// A stalled provider must not retain a watcher after another paste or the cap.
+async fn until_cancelled<T>(
+    generation: u64,
+    counter: &AtomicU64,
+    budget: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let deadline = Instant::now() + budget;
+    let mut future = std::pin::pin!(future);
+    loop {
+        if counter.load(Ordering::SeqCst) != generation || Instant::now() >= deadline {
+            return None;
+        }
+        let wait = POLL.min(deadline.saturating_duration_since(Instant::now()));
+        if let Ok(result) = tokio::time::timeout(wait, future.as_mut()).await {
+            return (counter.load(Ordering::SeqCst) == generation).then_some(result);
+        }
+    }
+}
+
+fn edited_span(current: &[char], before: &[char], after: &[char]) -> Option<String> {
     if current.len() < before.len() + after.len()
-        || !current.starts_with(&before)
-        || !current.ends_with(&after)
+        || !current.starts_with(before)
+        || !current.ends_with(after)
     {
-        log::debug!("atspi_edit: pasteId={paste_id} anchors changed — not reporting");
-        return Ok(None);
+        return None;
     }
-    let edited: String = current[before.len()..current.len() - after.len()]
-        .iter()
-        .collect();
-    if edited.trim().is_empty() || edited.chars().count() > MAX_REPORT_CHARS {
-        return Ok(None);
+    let edited = &current[before.len()..current.len() - after.len()];
+    if edited.len() > MAX_REPORT_CHARS {
+        return None;
     }
-    Ok(Some((edited, reason)))
+    let edited: String = edited.iter().collect();
+    (!edited.trim().is_empty()).then_some(edited)
 }
 
 /// Locate the focused field by descending only the active top-level window(s).
@@ -255,28 +286,33 @@ async fn find_focused_in_active_window(
     Ok(None)
 }
 
+fn observable_role(role: Option<Role>) -> bool {
+    matches!(role, Some(r) if r != Role::PasswordText && r != Role::Terminal)
+}
+
 /// Char offset of `needle` in `hay`: the occurrence ending at the caret if the
-/// toolkit reports one (a paste leaves the caret right after the text), else the
-/// last occurrence.
+/// toolkit reports one (a paste leaves the caret right after the text), otherwise
+/// require a unique occurrence. Ambiguous text is not safe to auto-learn from.
 fn locate(hay: &[char], needle: &[char], caret: i32) -> Option<usize> {
     let n = needle.len();
     if n == 0 || n > hay.len() {
         return None;
     }
-    if caret >= n as i32 {
-        let s = caret as usize - n;
-        if hay.get(s..s + n) == Some(needle) {
-            return Some(s);
-        }
+    if caret >= 0 {
+        let start = (caret as usize).checked_sub(n)?;
+        return (hay.get(start..start + n) == Some(needle)).then_some(start);
     }
-    (0..=hay.len() - n)
-        .rev()
-        .find(|&i| &hay[i..i + n] == needle)
+    let mut matches = hay
+        .windows(n)
+        .enumerate()
+        .filter(|(_, span)| *span == needle);
+    let (start, _) = matches.next()?;
+    matches.next().is_none().then_some(start)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::locate;
+    use super::*;
 
     fn c(s: &str) -> Vec<char> {
         s.chars().collect()
@@ -290,9 +326,101 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_last_occurrence_and_misses() {
-        assert_eq!(locate(&c("a b a"), &c("a"), -1), Some(4));
+    fn unique_occurrence_without_caret_and_misses() {
+        assert_eq!(locate(&c("a b c"), &c("b"), -1), Some(2));
         assert_eq!(locate(&c("abc"), &c("x"), 3), None);
         assert_eq!(locate(&c("é日本 x"), &c("日本"), 3), Some(1));
+    }
+
+    #[test]
+    fn skips_password_terminal_and_unknown_roles() {
+        assert!(!observable_role(Some(Role::PasswordText)));
+        assert!(!observable_role(Some(Role::Terminal)));
+        assert!(!observable_role(None));
+        assert!(observable_role(Some(Role::Entry)));
+        assert!(observable_role(Some(Role::Text)));
+    }
+
+    #[test]
+    fn ambiguous_or_mismatched_caret_is_not_guessed() {
+        assert_eq!(locate(&c("hi hi"), &c("hi"), -1), None);
+        assert_eq!(locate(&c("hi later"), &c("hi"), 8), None);
+    }
+
+    #[test]
+    fn extracts_only_the_edited_span_with_intact_anchors() {
+        assert_eq!(
+            edited_span(&c("before 日本 after"), &c("before "), &c(" after")),
+            Some("日本".into())
+        );
+        assert_eq!(
+            edited_span(&c("changed word after"), &c("before "), &c(" after")),
+            None
+        );
+        assert_eq!(
+            edited_span(&c("before word changed"), &c("before "), &c(" after")),
+            None
+        );
+        assert_eq!(
+            edited_span(&c("short"), &c("long before"), &c("after")),
+            None
+        );
+        assert_eq!(edited_span(&c("  "), &[], &[]), None);
+        assert_eq!(
+            edited_span(&vec!['x'; MAX_REPORT_CHARS + 1], &[], &[]),
+            None
+        );
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn stalled_observation_is_bounded() {
+        let counter = AtomicU64::new(1);
+        let result = runtime().block_on(until_cancelled(
+            1,
+            &counter,
+            Duration::from_millis(5),
+            std::future::pending::<()>(),
+        ));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn superseded_observation_is_discarded_even_when_ready() {
+        let counter = AtomicU64::new(1);
+        let result = runtime().block_on(until_cancelled(
+            1,
+            &counter,
+            Duration::from_secs(1),
+            async {
+                counter.store(2, Ordering::SeqCst);
+                "stale edit"
+            },
+        ));
+        assert_eq!(result, None);
+        assert_eq!(
+            runtime().block_on(until_cancelled(
+                2,
+                &counter,
+                Duration::from_secs(1),
+                async { "current edit" },
+            )),
+            Some("current edit")
+        );
+    }
+
+    #[test]
+    fn paste_without_an_id_still_cancels_previous_observation() {
+        let previous = GENERATION.load(Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch(String::new(), "next paste".into(), tx);
+        assert_eq!(GENERATION.load(Ordering::SeqCst), previous + 1);
+        assert!(rx.try_recv().is_err());
     }
 }

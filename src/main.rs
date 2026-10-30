@@ -162,6 +162,13 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let app = be.get_active_app().unwrap_or_default();
+            let is_terminal = paste::looks_like_terminal(&app.app_name, &app.bundle_id);
+            log::debug!(
+                "paste target: app='{}' id='{}' terminal={is_terminal}",
+                app.app_name, app.bundle_id
+            );
+            paste::set_focused_is_terminal(is_terminal);
             match be.paste_text(text, html) {
                 Ok(()) => {
                     ipc.send(&proto::ack(uuid));

@@ -40,7 +40,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | `SetFocusChangeDetectorState` → `AppInfoUpdate` | ⬜ (TODO: `PropertyNotify`) | ✅ **KDE** — focus events on fd 3, gated & deduped |
 | `GetSelectedTextViaCopy` | ⚠️ Ctrl+C copy-probe | ⚠️ Ctrl+C copy-probe |
 | `GetAccessibilityStatus` | ✅ (connection live) | ✅ (uinput live) |
-| `PasteText` → `UpdateEditedText` (auto-learn corrected words) | ✅ AT-SPI | ✅ AT-SPI — watches the pasted span, reports the edited text on focus loss / 15 s idle. GTK/Qt work out of the box; Chromium/Electron apps need `--force-renderer-accessibility`. Terminals and password fields are skipped. |
+| `PasteText` → `UpdateEditedText` (auto-learn corrected words) | ✅ AT-SPI | ✅ AT-SPI — watches the pasted span, reports the edited text on focus loss / 15 s idle. New pastes cancel older observations. GTK/Qt work out of the box; Chromium/Electron apps need `--force-renderer-accessibility`. Terminals, password fields, unknown roles and ambiguous pasted spans are skipped. |
 | everything else (intervals/BLE/panel/analytics…) | ACK no-op | ACK no-op |
 
 `detect()` picks Wayland when `$WAYLAND_DISPLAY` is set and `/dev/uinput` is
@@ -101,9 +101,9 @@ see wispr-flow-linux/wispr-flow-linux#35), so the chord is chosen per paste:
 
 1. **Focused app is a terminal emulator** (kitty, ghostty, alacritty, konsole,
    wezterm, foot, xterm, warp, … — list in `src/paste.rs::looks_like_terminal`,
-   matched against the active app's name / `resourceClass`): **Ctrl+Shift+V**.
-   Detection uses the composing `ActiveAppProvider` (KWin bridge / GNOME
-   extension / AT-SPI), so it needs no configuration and leaves non-terminal
+   matched against the active app's name / `bundleId`): **Ctrl+Shift+V**.
+   Detection uses native X11 identity or the `ActiveAppProvider` (KWin bridge /
+   GNOME extension / AT-SPI), so it needs no configuration and leaves non-terminal
    apps on the stock chord. Unknown focus → Ctrl+V.
 2. **`WISPR_LINUX_HELPER_PASTE_KEYS`** env var, when set, overrides detection
    globally (`ctrl+v` or `ctrl+shift+v`) — the escape hatch if your terminal
@@ -173,3 +173,14 @@ proprietary code, and is released into the public domain under the
 [Unlicense](UNLICENSE). The app itself remains under its own terms — see the
 [legal posture](https://github.com/wispr-flow-linux/wispr-flow-linux#legal-posture)
 in the main repo.
+
+## Isolated integration test
+
+`parity_test.py` starts its own Xvfb display and D-Bus session and tests the real
+helper against GTK fields. It verifies native X11 terminal paste detection,
+invalid-override clipboard preservation, and post-paste Unicode corrections.
+It requires Python 3 with PyGObject/GTK 3, Xvfb, xdotool, xprop and xclip.
+
+```bash
+/usr/bin/python3 parity_test.py ./target/debug/wispr-flow-linux-helper
+```

@@ -4,7 +4,7 @@
 //! Default is Ctrl+V. Resolution order for each paste:
 //!   1. `WISPR_LINUX_HELPER_PASTE_KEYS` env var — force a chord globally
 //!      (`ctrl+v` or `ctrl+shift+v`). Always wins when set.
-//!   2. Per-app detection — the composing layer (`Composed`) inspects the
+//!   2. Per-app detection — the request dispatcher inspects the
 //!      focused app right before delegating the paste and records whether it
 //!      is a terminal emulator. Terminals get Ctrl+Shift+V (their paste
 //!      binding; Ctrl+V is literal-insert in shells), everything else keeps
@@ -29,7 +29,7 @@ const CTRL_SHIFT_V: PasteChord = PasteChord {
 };
 
 thread_local! {
-    /// Per-paste flag recorded by the composing layer after inspecting the
+    /// Per-paste flag recorded by the request dispatcher after inspecting the
     /// focused app. The request dispatch loop in main.rs is single-threaded,
     /// so a thread-local is race-free: it is set immediately before the
     /// matching `paste_text` delegation and consumed synchronously inside it.
@@ -37,7 +37,7 @@ thread_local! {
 }
 
 /// Record whether the currently focused app is a terminal emulator. Called by
-/// `Composed::paste_text` right before delegating to the injector.
+/// the request dispatcher right before calling the injector.
 pub fn set_focused_is_terminal(is_terminal: bool) {
     FOCUSED_IS_TERMINAL.with(|c| c.set(is_terminal));
 }
@@ -72,9 +72,8 @@ fn parse(value: &str) -> Result<PasteChord, String> {
 /// paste with Ctrl+Shift+V; Ctrl+V never reaches their clipboard handler (it
 /// is quoted-insert in readline, visual-block in vim, etc.).
 pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
-    // Distinctive names: substring match is safe (covers "org.kde.konsole",
-    // "com.mitchellh.ghostty.desktop", "kitty", ...).
-    const SUBSTR: &[&str] = &[
+    // Match whole app-id/name components: "warp" must not match Warpinator.
+    const TERMINALS: &[&str] = &[
         "kitty",
         "alacritty",
         "ghostty",
@@ -83,6 +82,7 @@ pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
         "foot",
         "gnome-terminal",
         "kgx",
+        "ptyxis",
         "xterm",
         "urxvt",
         "terminator",
@@ -105,14 +105,18 @@ pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
         "rio",
         "hyper",
     ];
-    // Short/ambiguous names: exact match only ("st" as a substring would
-    // false-positive on half the dictionary).
     const EXACT: &[&str] = &["st", "st-256color", "term", "eterm", "aterm"];
     let name = app_name.to_ascii_lowercase();
     let id = bundle_id.to_ascii_lowercase();
     let id_base = id.strip_suffix(".desktop").unwrap_or(&id);
-    SUBSTR.iter().any(|t| name.contains(t) || id.contains(t))
-        || EXACT.iter().any(|t| name == *t || id_base == *t)
+    matches!(
+        id_base,
+        "org.gnome.console" | "org.gnome.ptyxis" | "org.gnome.terminal"
+    ) || [&name, &id].iter().any(|value| {
+        value
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .any(|part| TERMINALS.contains(&part))
+    }) || EXACT.iter().any(|t| name == *t || id_base == *t)
 }
 
 #[cfg(test)]
@@ -155,5 +159,31 @@ mod tests {
         // "st" must not substring-match arbitrary names:
         assert!(!looks_like_terminal("Star Editor", "star.desktop"));
         assert!(!looks_like_terminal("Steam", "steam.desktop"));
+    }
+
+    #[test]
+    fn detects_gnome_terminal_desktop_ids() {
+        for id in [
+            "org.gnome.Console.desktop",
+            "org.gnome.Ptyxis",
+            "org.gnome.Terminal.desktop",
+        ] {
+            assert!(looks_like_terminal("", id), "{id}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_terminal_names_require_whole_words() {
+        for (name, id) in [
+            ("Warpinator", "org.x.Warpinator.desktop"),
+            ("Footnotes", "com.example.footnotes"),
+            ("Hyperion", "hyperion.desktop"),
+            ("Portfolio", "portfolio.desktop"),
+        ] {
+            assert!(!looks_like_terminal(name, id), "{name}");
+        }
+        for name in ["Warp", "Rio", "Hyper", "Foot"] {
+            assert!(looks_like_terminal(name, ""), "{name}");
+        }
     }
 }
