@@ -143,9 +143,15 @@ ApplicationWindow {
                 assert test.poll() is None, (logs / "observer.log").read_text()
                 assert time.monotonic() < deadline, "Focus listener did not start"
                 time.sleep(0.02)
-            key("key", "Tab")
-            key("key", "shift+Tab")
-            key("key", "End")
+            # Registration reaches toolkit bridges asynchronously on a fresh bus.
+            deadline = time.monotonic() + 7
+            while "using focus-event target" not in (logs / "observer.log").read_text():
+                assert test.poll() is None, (logs / "observer.log").read_text()
+                assert time.monotonic() < deadline, "Toolkit did not deliver focus events"
+                key("key", "Tab")
+                key("key", "shift+Tab")
+                key("key", "End")
+                time.sleep(0.5)
         deadline = time.monotonic() + 12
         while "observing (before=" not in (logs / "observer.log").read_text():
             if test.poll() is not None:
