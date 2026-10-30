@@ -47,3 +47,11 @@ jobs:
         run: |
           CHROMIUM_BIN="$(command -v google-chrome)" /usr/bin/python3 \
             edit_observation_test.py /tmp/helper-tests.json --chromium
+      - name: Test native focus and headless detection
+        run: |
+          env -u WAYLAND_DISPLAY xvfb-run -a cargo test native_focus -- --ignored
+          env -u DISPLAY -u WAYLAND_DISPLAY cargo test headless_skips -- --ignored
+      - name: Test browser-site detection over real IPC
+        run: |
+          CHROMIUM_BIN="$(command -v google-chrome)" /usr/bin/python3 \
+            browser_style_test.py target/debug/wispr-flow-linux-helper

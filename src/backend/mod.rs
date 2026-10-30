@@ -102,7 +102,7 @@ pub fn active_app_payload(a: &ActiveApp) -> serde_json::Value {
 /// **independently of the injection backend** (so active-app works even where
 /// injection doesn't, e.g. a GNOME session without `/dev/uinput`).
 ///
-/// Layered "never blank" design:
+/// Session-specific providers:
 ///   * Tier-2 premium, per-compositor: `kwin::KwinTracker` (KDE),
 ///     `gnome::GnomeTracker` (GNOME Shell extension) — richest, most reliable
 ///     identity (true app-id, full window list, robust focus).
@@ -110,7 +110,7 @@ pub fn active_app_payload(a: &ActiveApp) -> serde_json::Value {
 ///     over the accessibility bus; the fallback that covers wlroots
 ///     (Sway/Hyprland/niri), GNOME pre-relogin, and incomplete-`_NET_*` X11.
 ///
-/// All three trackers already expose `current` / `set_focus_detection` and a
+/// The compositor/accessibility trackers expose `current` / `set_focus_detection` and a
 /// running-apps accessor; this trait unifies them (inherent methods win in
 /// resolution, so the delegating bodies don't recurse). `KwinTracker` names its
 /// accessor `running_apps()`, the others `get_running_apps()` — bridged here.
@@ -168,13 +168,12 @@ impl ActiveAppProvider for atspi_app::AtspiTracker {
 
 /// Composes an injection backend with an active-app provider. Injection,
 /// clipboard, and selection delegate to `inner`; active-app / running-apps /
-/// focus come from `inner` **first** (so the X11 backend's authoritative native
-/// `_NET_*` read wins where present) and fall back to the `provider` (so Wayland
-/// — where `inner` returns empty — and incomplete-`_NET_*` X11 still get
-/// identity; the provider also supplies focus events the inner backend lacks).
+/// focus use native X11 on X11, and exclusively the compositor/accessibility
+/// provider on Wayland. An XWayland injector must never supply app identity.
 struct Composed {
     inner: Box<dyn Backend>,
-    provider: Box<dyn ActiveAppProvider>,
+    provider: Option<Box<dyn ActiveAppProvider>>,
+    wayland: bool,
 }
 
 impl Backend for Composed {
@@ -187,6 +186,14 @@ impl Backend for Composed {
     }
 
     fn get_active_app(&mut self) -> Result<ActiveApp> {
+        // XWayland can retain an old X11 window while a native window is focused.
+        if self.wayland {
+            return Ok(self
+                .provider
+                .as_ref()
+                .and_then(|p| p.current())
+                .unwrap_or_default());
+        }
         let inner = self.inner.get_active_app().unwrap_or_default();
         if !inner.app_name.is_empty()
             || !inner.bundle_id.is_empty()
@@ -194,7 +201,7 @@ impl Backend for Composed {
         {
             return Ok(inner);
         }
-        if let Some(app) = self.provider.current() {
+        if let Some(app) = self.provider.as_ref().and_then(|p| p.current()) {
             return Ok(app);
         }
         Ok(inner)
@@ -205,7 +212,11 @@ impl Backend for Composed {
         if !inner.is_empty() {
             return Ok(inner);
         }
-        Ok(self.provider.get_running_apps())
+        Ok(self
+            .provider
+            .as_ref()
+            .map(|p| p.get_running_apps())
+            .unwrap_or_default())
     }
 
     fn get_selected_text(&mut self) -> Result<Selection> {
@@ -220,7 +231,9 @@ impl Backend for Composed {
         // Forward to both: the inner backend no-ops on Wayland/X11 today; the
         // provider is what actually emits `AppInfoUpdate` focus events.
         self.inner.set_focus_detection(active);
-        self.provider.set_focus_detection(active);
+        if let Some(provider) = &self.provider {
+            provider.set_focus_detection(active);
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -242,23 +255,16 @@ impl Backend for Composed {
 pub fn detect(events: EventSink) -> Box<dyn Backend> {
     let provider = pick_active_app_provider(events);
     let injector = pick_injector();
-    match provider {
-        Some(p) => {
-            log::info!(
-                "backend: {} injection + {} active-app provider",
-                injector.name(),
-                p.name()
-            );
-            Box::new(Composed {
-                inner: injector,
-                provider: p,
-            })
-        }
-        None => {
-            log::info!("backend: {} (no active-app provider)", injector.name());
-            injector
-        }
-    }
+    log::info!(
+        "backend: {} injection + {} active-app provider",
+        injector.name(),
+        provider.as_ref().map(|p| p.name()).unwrap_or("none")
+    );
+    Box::new(Composed {
+        inner: injector,
+        provider,
+        wayland: env_set("WAYLAND_DISPLAY"),
+    })
 }
 
 /// True iff env var `var` is set to a **non-empty** value. An empty
@@ -329,11 +335,11 @@ fn pick_active_app_provider(events: EventSink) -> Option<Box<dyn ActiveAppProvid
         return start_atspi(events, "Wayland");
     }
     if env_set("DISPLAY") {
-        // X11: the X11 backend reads `_NET_*` natively and is authoritative (the
-        // `Composed` inner-first ordering uses it). Attach AT-SPI as a *fallback*
-        // so WMs with incomplete `_NET_*` still resolve identity, and so X11 gets
-        // focus events (which the native backend doesn't emit yet) for free.
-        return start_atspi(events, "X11 fallback (native _NET_* is primary)");
+        match x11::FocusTracker::start(events.clone()) {
+            Ok(tracker) => return Some(Box::new(tracker)),
+            Err(e) => log::warn!("X11 focus tracker unavailable ({e}); trying AT-SPI"),
+        }
+        return start_atspi(events, "X11 fallback");
     }
     None
 }
@@ -358,4 +364,85 @@ fn is_gnome() -> bool {
     probe("XDG_CURRENT_DESKTOP").contains("GNOME")
         || probe("XDG_SESSION_DESKTOP").contains("GNOME")
         || std::env::var_os("GNOME_SHELL_SESSION_MODE").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct AppBackend;
+    impl Backend for AppBackend {
+        fn get_active_app(&mut self) -> Result<ActiveApp> {
+            Ok(ActiveApp {
+                bundle_id: "Code".into(),
+                ..Default::default()
+            })
+        }
+        fn get_running_apps(&mut self) -> Result<Vec<RunningApp>> {
+            Ok(vec![])
+        }
+        fn paste_text(&mut self, _: &str, _: Option<&str>) -> Result<()> {
+            Ok(())
+        }
+        fn simulate_key_press(&mut self, _: u32, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn get_selected_text(&mut self) -> Result<Selection> {
+            Ok(Selection::default())
+        }
+        fn accessibility_status(&mut self) -> bool {
+            false
+        }
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+    struct Provider(Option<&'static str>);
+    impl ActiveAppProvider for Provider {
+        fn current(&self) -> Option<ActiveApp> {
+            self.0.map(|id| ActiveApp {
+                bundle_id: id.into(),
+                ..Default::default()
+            })
+        }
+        fn get_running_apps(&self) -> Vec<RunningApp> {
+            vec![]
+        }
+        fn set_focus_detection(&self, _: bool) {}
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn native_wayland_identity_wins_over_xwayland_and_fails_to_generic() {
+        let mut be = Composed {
+            inner: Box::new(AppBackend),
+            provider: Some(Box::new(Provider(Some("Cursor")))),
+            wayland: true,
+        };
+        assert_eq!(be.get_active_app().unwrap().bundle_id, "Cursor");
+        be.provider = Some(Box::new(Provider(None)));
+        assert_eq!(be.get_active_app().unwrap().bundle_id, "");
+        be.provider = None;
+        assert_eq!(be.get_active_app().unwrap().bundle_id, "");
+        be.wayland = false;
+        assert_eq!(be.get_active_app().unwrap().bundle_id, "Code");
+    }
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "run with DISPLAY and WAYLAND_DISPLAY unset"]
+    fn headless_skips_app_and_field_focus_detection() {
+        assert!(!env_set("DISPLAY") && !env_set("WAYLAND_DISPLAY"));
+        let (tx, _) = std::sync::mpsc::channel();
+        assert!(pick_active_app_provider(tx.clone()).is_none());
+        assert!(atspi_focus::start().is_none());
+        let mut backend = detect(tx);
+        assert!(backend.get_active_app().unwrap().bundle_id.is_empty());
+    }
 }

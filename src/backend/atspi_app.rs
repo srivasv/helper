@@ -515,7 +515,7 @@ async fn resolve_active_app(conn: &Connection, source: &ObjectRef) -> ActiveApp 
 /// bus for the owning PID, then reading `/proc/<pid>/comm` (friendly name) and
 /// `/proc/<pid>/exe` basename (best-effort bundle_id). Returns empties on any
 /// failure (e.g. sandboxed apps where the PID isn't resolvable).
-async fn identity_from_sender(conn: &Connection, sender: &str) -> (String, String) {
+pub(crate) async fn identity_from_sender(conn: &Connection, sender: &str) -> (String, String) {
     // The a11y bus connection is NOT the session bus; PID resolution must go
     // through the session bus's org.freedesktop.DBus. But the a11y bus also
     // implements GetConnectionUnixProcessID for names on *its* bus, and `sender`
