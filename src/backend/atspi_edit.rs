@@ -109,7 +109,7 @@ async fn run(
         if let Ok(p) = obj.as_accessible_proxy(conn).await {
             if p.get_state()
                 .await
-                .map(|s| s.contains(State::Focused))
+                .map(|s| s.contains(State::Focused) && s.contains(State::Editable))
                 .unwrap_or(false)
             {
                 focused = Some(obj);
@@ -287,7 +287,7 @@ async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::Obj
     windows.sort_by_key(|(active, _)| !active);
     let mut budget = WALK_NODES;
     for (_, win) in windows {
-        if let Some(f) = descend_for_focus(conn, &win, 0, WALK_DEPTH, &mut budget).await {
+        if let Some(f) = descend_for_focus(conn, &win, 0, WALK_DEPTH, &mut budget, true).await {
             return Ok(Some(f));
         }
         if budget == 0 {
@@ -435,6 +435,70 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    struct FocusFixture {
+        editable: bool,
+        children: Vec<atspi::ObjectRef>,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl FocusFixture {
+        fn get_state(&self) -> atspi::StateSet {
+            let mut states = atspi::StateSet::from(State::Focused);
+            if self.editable {
+                states.insert(State::Editable);
+            }
+            states
+        }
+
+        fn get_children(&self) -> Vec<atspi::ObjectRef> {
+            self.children.clone()
+        }
+    }
+
+    async fn check_noneditable_focus() {
+        let server = zbus::Connection::session().await.unwrap();
+        let client = zbus::Connection::session().await.unwrap();
+        let child = atspi::ObjectRef {
+            name: server.unique_name().unwrap().clone(),
+            path: "/fixture/child".try_into().unwrap(),
+        };
+        let parent = atspi::ObjectRef {
+            name: child.name.clone(),
+            path: "/fixture/parent".try_into().unwrap(),
+        };
+        server
+            .object_server()
+            .at(
+                child.path.clone(),
+                FocusFixture {
+                    editable: true,
+                    children: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        server
+            .object_server()
+            .at(
+                parent.path.clone(),
+                FocusFixture {
+                    editable: false,
+                    children: vec![child.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            descend_for_focus(&client, &parent, 0, 8, &mut 10, true).await,
+            Some(child)
+        );
+        // Selection reads must still support focused, read-only widgets.
+        assert_eq!(
+            descend_for_focus(&client, &parent, 0, 8, &mut 10, false).await,
+            Some(parent)
+        );
+    }
+
     #[test]
     #[ignore = "requires gtk4_edit_test.py's isolated Zenity fixture"]
     fn gtk4_observation_without_focus_tracker() {
@@ -443,6 +507,7 @@ mod tests {
             Ok("1")
         );
         let _ = env_logger::try_init();
+        runtime().block_on(check_noneditable_focus());
         let generation = GENERATION.load(Ordering::SeqCst);
         let result = runtime().block_on(until_cancelled(
             generation,
