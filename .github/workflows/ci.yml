@@ -27,3 +27,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Install isolated integration test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-3.0 at-spi2-core \
+            dbus-x11 xvfb xauth xdotool x11-utils xclip
+      - run: cargo build --locked
+      - name: Test paste shortcuts and post-paste edits over real IPC
+        run: /usr/bin/python3 parity_test.py target/debug/wispr-flow-linux-helper

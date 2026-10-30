@@ -90,7 +90,7 @@ async fn probe() -> Result<Option<Selection>, String> {
 
 /// The accessibility hierarchy root: the registry's desktop object. All running
 /// applications hang off it as children.
-async fn desktop_root(conn: &Connection) -> Result<AccessibleProxy<'static>, String> {
+pub(super) async fn desktop_root(conn: &Connection) -> Result<AccessibleProxy<'static>, String> {
     AccessibleProxy::builder(conn)
         .destination("org.a11y.atspi.Registry")
         .map_err(|e| format!("root destination: {e}"))?
@@ -112,7 +112,7 @@ async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
 
     let mut budget = MAX_NODES;
     for app in apps {
-        if let Some(found) = descend_for_focus(conn, &app, 0, &mut budget).await {
+        if let Some(found) = descend_for_focus(conn, &app, 0, MAX_DEPTH, &mut budget).await {
             return Ok(Some(found));
         }
         if budget == 0 {
@@ -124,13 +124,14 @@ async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
 
 /// Depth-first search under `obj` for an accessible holding `State::Focused`.
 /// `budget` is a shared node cap decremented across the whole walk.
-async fn descend_for_focus(
+pub(super) async fn descend_for_focus(
     conn: &Connection,
     obj: &ObjectRef,
     depth: usize,
+    max_depth: usize,
     budget: &mut usize,
 ) -> Option<ObjectRef> {
-    if depth > MAX_DEPTH || *budget == 0 {
+    if depth > max_depth || *budget == 0 {
         return None;
     }
     *budget -= 1;
@@ -151,7 +152,15 @@ async fn descend_for_focus(
         if *budget == 0 {
             break;
         }
-        if let Some(found) = Box::pin(descend_for_focus(conn, &child, depth + 1, budget)).await {
+        if let Some(found) = Box::pin(descend_for_focus(
+            conn,
+            &child,
+            depth + 1,
+            max_depth,
+            budget,
+        ))
+        .await
+        {
             return Some(found);
         }
     }

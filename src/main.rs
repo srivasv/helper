@@ -14,6 +14,7 @@
 mod backend;
 mod capture;
 mod keymap;
+mod paste;
 mod proto;
 
 use std::io::{Read, Write};
@@ -161,8 +162,20 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let app = be.get_active_app().unwrap_or_default();
+            let is_terminal = paste::looks_like_terminal(&app.app_name, &app.bundle_id);
+            log::debug!(
+                "paste target: app='{}' id='{}' terminal={is_terminal}",
+                app.app_name, app.bundle_id
+            );
+            paste::set_focused_is_terminal(is_terminal);
             match be.paste_text(text, html) {
-                Ok(()) => ipc.send(&proto::ack(uuid)),
+                Ok(()) => {
+                    ipc.send(&proto::ack(uuid));
+                    // Observe the field so corrected words can be auto-learned.
+                    let paste_id = payload.get("pasteId").and_then(Value::as_str).unwrap_or("");
+                    backend::atspi_edit::watch(paste_id.to_string(), text.to_string(), ipc.tx.clone());
+                }
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
                     ipc.send(&proto::error(&format!("PasteText failed: {e}"), uuid));
