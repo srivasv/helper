@@ -8,6 +8,7 @@
 
 pub mod atspi_app;
 pub mod atspi_edit;
+pub mod atspi_focus;
 pub mod atspi_sel;
 mod copy_probe;
 pub mod gnome;

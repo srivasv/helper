@@ -23,8 +23,8 @@ use atspi::proxy::text::TextProxy;
 use atspi::{Role, State};
 use serde_json::{json, Value};
 
-use super::atspi_app::LAST_FOCUSED_WIDGET;
-use super::atspi_sel::{descend_for_focus, desktop_root};
+use super::atspi_focus::LAST_FOCUSED_WIDGET;
+use super::atspi_sel::desktop_root;
 use crate::proto;
 
 /// Let the Ctrl+V land (and the toolkit emit its text update) before baselining.
@@ -112,6 +112,7 @@ async fn run(
                 .map(|s| s.contains(State::Focused) && s.contains(State::Editable))
                 .unwrap_or(false)
             {
+                log::debug!("atspi_edit: using focus-event target");
                 focused = Some(obj);
             }
         }
@@ -285,13 +286,50 @@ async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::Obj
     }
     // GTK4 dialogs can expose a focused field without an Active parent.
     windows.sort_by_key(|(active, _)| !active);
-    let mut budget = WALK_NODES;
-    for (_, win) in windows {
-        if let Some(f) = descend_for_focus(conn, &win, 0, WALK_DEPTH, &mut budget, true).await {
-            return Ok(Some(f));
-        }
-        if budget == 0 {
+    search_windows(
+        conn,
+        windows.into_iter().map(|(_, win)| win).collect(),
+        WALK_NODES,
+    )
+    .await
+}
+
+/// Visit one node per window per round so large desktop trees cannot starve apps.
+async fn search_windows(
+    conn: &zbus::Connection,
+    windows: Vec<atspi::ObjectRef>,
+    mut budget: usize,
+) -> Result<Option<atspi::ObjectRef>, String> {
+    let mut walks: std::collections::VecDeque<_> =
+        windows.into_iter().map(|win| vec![(win, 0usize)]).collect();
+    while budget > 0 {
+        let Some(mut pending) = walks.pop_front() else {
             break;
+        };
+        let Some((obj, depth)) = pending.pop() else {
+            continue;
+        };
+        budget -= 1;
+        if let Ok(proxy) = obj.as_accessible_proxy(conn).await {
+            if let Ok(states) = proxy.get_state().await {
+                if states.contains(State::Focused) && states.contains(State::Editable) {
+                    return Ok(Some(obj));
+                }
+            }
+            if depth < WALK_DEPTH {
+                for child in proxy
+                    .get_children()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                {
+                    pending.push((child, depth + 1));
+                }
+            }
+        }
+        if !pending.is_empty() {
+            walks.push_back(pending);
         }
     }
     Ok(None)
@@ -323,6 +361,7 @@ fn locate(hay: &[char], needle: &[char], caret: i32) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::atspi_sel::descend_for_focus;
     use super::*;
 
     fn c(s: &str) -> Vec<char> {
@@ -393,6 +432,8 @@ mod tests {
     #[test]
     fn stalled_observation_is_bounded() {
         let counter = AtomicU64::new(1);
+        // Match watch()'s post-paste settle before sampling the focused field.
+        std::thread::sleep(SETTLE);
         let result = runtime().block_on(until_cancelled(
             1,
             &counter,
@@ -405,6 +446,8 @@ mod tests {
     #[test]
     fn superseded_observation_is_discarded_even_when_ready() {
         let counter = AtomicU64::new(1);
+        // Match watch()'s post-paste settle before sampling the focused field.
+        std::thread::sleep(SETTLE);
         let result = runtime().block_on(until_cancelled(
             1,
             &counter,
@@ -489,26 +532,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            descend_for_focus(&client, &parent, 0, 8, &mut 10, true).await,
-            Some(child)
+            search_windows(&client, vec![parent.clone()], 10)
+                .await
+                .unwrap(),
+            Some(child.clone())
+        );
+        let distractor = atspi::ObjectRef {
+            name: child.name.clone(),
+            path: "/fixture/distractor".try_into().unwrap(),
+        };
+        server
+            .object_server()
+            .at(
+                distractor.path.clone(),
+                FocusFixture {
+                    editable: false,
+                    children: vec![parent.clone(); 20],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            search_windows(&client, vec![distractor, child.clone()], 2)
+                .await
+                .unwrap(),
+            Some(child.clone())
         );
         // Selection reads must still support focused, read-only widgets.
         assert_eq!(
-            descend_for_focus(&client, &parent, 0, 8, &mut 10, false).await,
+            descend_for_focus(&client, &parent, 0, 8, &mut 10).await,
             Some(parent)
         );
     }
 
     #[test]
-    #[ignore = "requires gtk4_edit_test.py's isolated Zenity fixture"]
-    fn gtk4_observation_without_focus_tracker() {
+    #[ignore = "requires edit_observation_test.py's isolated toolkit fixture"]
+    fn toolkit_edit_observation() {
         assert_eq!(
-            std::env::var("WISPR_GTK4_TEST_ISOLATED").as_deref(),
+            std::env::var("WISPR_EDIT_TEST_ISOLATED").as_deref(),
             Ok("1")
         );
         let _ = env_logger::try_init();
         runtime().block_on(check_noneditable_focus());
+        let _tracker = if std::env::var("WISPR_TEST_FOCUS_EVENTS").as_deref() == Ok("1") {
+            let tracker = super::super::atspi_focus::start().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while LAST_FOCUSED_WIDGET.lock().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "No field focus event received");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Some(tracker)
+        } else {
+            None
+        };
+
         let generation = GENERATION.load(Ordering::SeqCst);
+        // Match watch()'s post-paste settle before sampling the focused field.
+        std::thread::sleep(SETTLE);
         let result = runtime().block_on(until_cancelled(
             generation,
             &GENERATION,

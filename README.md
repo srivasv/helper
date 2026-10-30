@@ -185,12 +185,15 @@ It requires Python 3 with PyGObject/GTK 3, Xvfb, xdotool, xprop and xclip.
 /usr/bin/python3 parity_test.py ./target/debug/wispr-flow-linux-helper
 ```
 
-The GTK4 regression also checks Zenity dialogs whose focused field has no
-`Active` parent, without relying on the AT-SPI focus tracker used on X11.
-This covers the observer path used with the KWin/GNOME app providers.
-It requires GTK4 Zenity in addition to the integration dependencies above.
+The edit-observation regression runs GTK4 Zenity and Qt KDialog with both
+focus-event targeting and bounded fallback search. It checks event delivery,
+corrected text, non-editable focus targets, and fair traversal across windows.
+The helper listens for GTK focused-state changes and Qt legacy focus events
+independently of the compositor's active-app provider. Unsupported or stale
+accessibles fall back to a bounded search; private fields remain excluded.
+It requires GTK4 Zenity and KDialog in addition to the dependencies above.
 
 ```bash
 cargo test --locked --no-run --message-format=json > /tmp/helper-tests.json
-/usr/bin/python3 gtk4_edit_test.py /tmp/helper-tests.json
+/usr/bin/python3 edit_observation_test.py /tmp/helper-tests.json
 ```

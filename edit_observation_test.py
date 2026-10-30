@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise edit observation without a focus tracker against a real GTK4 dialog."""
+"""Exercise GTK4 and Qt edit observation with focus events and bounded search."""
 
 import os
 import json
@@ -28,32 +28,38 @@ if len(sys.argv) == 2:
             GDK_BACKEND="x11",
             NO_AT_BRIDGE="0",
             GTK_A11Y="atspi",
-            WISPR_GTK4_TEST_ISOLATED="1",
+            QT_QPA_PLATFORM="xcb",
+            QT_LINUX_ACCESSIBILITY_ALWAYS_ON="1",
+            WISPR_EDIT_TEST_ISOLATED="1",
             RUST_LOG="wispr_flow_linux_helper=debug",
         )
         for key in ("WAYLAND_DISPLAY", "AT_SPI_BUS_ADDRESS", "KDE_FULL_SESSION"):
             env.pop(key, None)
-        raise SystemExit(
-            subprocess.call(
-                [
-                    "xvfb-run",
-                    "-a",
-                    "dbus-run-session",
-                    "--",
-                    sys.executable,
-                    os.path.abspath(__file__),
-                    "--isolated",
-                    binary,
-                ],
-                env=env,
-            )
-        )
+        for toolkit in ("gtk4", "qt"):
+            for focus_events in ("0", "1"):
+                env["WISPR_TEST_TOOLKIT"] = toolkit
+                env["WISPR_TEST_FOCUS_EVENTS"] = focus_events
+                result = subprocess.call(
+                    ["xvfb-run", "-a", "dbus-run-session", "--", sys.executable,
+                     os.path.abspath(__file__), "--isolated", binary], env=env,
+                )
+                if result:
+                    raise SystemExit(result)
+        raise SystemExit(0)
+
 if len(sys.argv) != 3 or sys.argv[1] != "--isolated":
-    raise SystemExit("usage: gtk4_edit_test.py <cargo-test-build.json>")
+    raise SystemExit("usage: edit_observation_test.py <cargo-test-build.json>")
 
 
-version = subprocess.check_output(["zenity", "--version"], text=True).strip()
-assert int(version.split(".")[0]) >= 4, "This regression requires GTK4 Zenity"
+toolkit = os.environ["WISPR_TEST_TOOLKIT"]
+if toolkit == "gtk4":
+    version = subprocess.check_output(["zenity", "--version"], text=True).strip()
+    assert int(version.split(".")[0]) >= 4, "This regression requires GTK4 Zenity"
+    dialog_command = ["zenity", "--entry", "--title=Wispr edit regression",
+                      "--text=Test field", "--entry-text=hello wisper world"]
+else:
+    dialog_command = ["kdialog", "--title", "Wispr edit regression",
+                      "--inputbox", "Test field", "hello wisper world"]
 
 
 def key(*args):
@@ -64,13 +70,7 @@ with tempfile.TemporaryDirectory(prefix="wispr-gtk4-logs-") as logs:
     logs = Path(logs)
     with open(logs / "zenity.log", "w") as log:
         zenity = subprocess.Popen(
-            [
-                "zenity",
-                "--entry",
-                "--title=Wispr GTK4 edit regression",
-                "--text=Test field",
-                "--entry-text=hello wisper world",
-            ],
+            dialog_command,
             stdout=subprocess.DEVNULL,
             stderr=log,
         )
@@ -114,18 +114,29 @@ with tempfile.TemporaryDirectory(prefix="wispr-gtk4-logs-") as logs:
                     sys.argv[2],
                     "--ignored",
                     "--exact",
-                    "backend::atspi_edit::tests::gtk4_observation_without_focus_tracker",
+                    "backend::atspi_edit::tests::toolkit_edit_observation",
                     "--nocapture",
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
+        if os.environ.get("WISPR_TEST_FOCUS_EVENTS") == "1":
+            deadline = time.monotonic() + 8
+            while "atspi_focus: listening" not in (logs / "observer.log").read_text():
+                assert test.poll() is None, (logs / "observer.log").read_text()
+                assert time.monotonic() < deadline, "Focus listener did not start"
+                time.sleep(0.02)
+            key("key", "Tab")
+            key("key", "shift+Tab")
+            key("key", "End")
         deadline = time.monotonic() + 12
         while "observing (before=" not in (logs / "observer.log").read_text():
             if test.poll() is not None:
                 raise AssertionError((logs / "observer.log").read_text())
             assert time.monotonic() < deadline, "Observer did not baseline the field"
             time.sleep(0.02)
+        if os.environ.get("WISPR_TEST_FOCUS_EVENTS") == "1":
+            assert "using focus-event target" in (logs / "observer.log").read_text()
         key("key", "ctrl+a")
         key("type", "--clearmodifiers", "hello whisper world")
         # Allow two observer polls to capture the completed correction.
@@ -133,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="wispr-gtk4-logs-") as logs:
         key("key", "Tab")
         result = test.wait(timeout=5)
         assert result == 0, (logs / "observer.log").read_text()
-        print("PASS: GTK4 correction observed without an AT-SPI focus tracker")
+        print("PASS: " + toolkit + " correction observed; focus events=" + os.environ.get("WISPR_TEST_FOCUS_EVENTS", "0"))
     finally:
         if test is not None and test.poll() is None:
             test.terminate()

@@ -112,7 +112,7 @@ async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
 
     let mut budget = MAX_NODES;
     for app in apps {
-        if let Some(found) = descend_for_focus(conn, &app, 0, MAX_DEPTH, &mut budget, false).await {
+        if let Some(found) = descend_for_focus(conn, &app, 0, MAX_DEPTH, &mut budget).await {
             return Ok(Some(found));
         }
         if budget == 0 {
@@ -130,7 +130,6 @@ pub(super) async fn descend_for_focus(
     depth: usize,
     max_depth: usize,
     budget: &mut usize,
-    require_editable: bool,
 ) -> Option<ObjectRef> {
     if depth > max_depth || *budget == 0 {
         return None;
@@ -139,11 +138,9 @@ pub(super) async fn descend_for_focus(
 
     let proxy = obj.as_accessible_proxy(conn).await.ok()?;
 
-    // Desktop widgets can retain Focused; edit observers need Editable too.
+    // Selection reads also support focused, read-only widgets.
     if let Ok(states) = proxy.get_state().await {
-        if states.contains(State::Focused)
-            && (!require_editable || states.contains(State::Editable))
-        {
+        if states.contains(State::Focused) {
             return Some(obj.clone());
         }
     }
@@ -161,7 +158,6 @@ pub(super) async fn descend_for_focus(
             depth + 1,
             max_depth,
             budget,
-            require_editable,
         ))
         .await
         {
