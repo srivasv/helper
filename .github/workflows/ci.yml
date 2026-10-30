@@ -55,3 +55,5 @@ jobs:
         run: |
           CHROMIUM_BIN="$(command -v google-chrome)" /usr/bin/python3 \
             browser_style_test.py target/debug/wispr-flow-linux-helper
+      - name: Test selected text and embedded terminal paste detection
+        run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test selection_discovers_deep_active_editor -- --ignored
