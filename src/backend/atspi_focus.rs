@@ -18,6 +18,9 @@ impl Drop for FocusTracker {
 }
 
 pub fn start() -> Option<FocusTracker> {
+    if !super::env_set("DISPLAY") && !super::env_set("WAYLAND_DISPLAY") {
+        return None;
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let result = std::thread::Builder::new()

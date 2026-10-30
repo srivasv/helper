@@ -114,9 +114,68 @@ impl X11Backend {
     }
 
     fn active_window(&self) -> Result<Option<Window>> {
-        Ok(self
+        if let Some(win) = self
             .get_property_u32(self.root, self.atoms.net_active_window)?
-            .filter(|&w| w != 0))
+            .filter(|&w| w != 0 && w != self.root)
+        {
+            return Ok(Some(win));
+        }
+        // Minimal WMs may omit EWMH; input focus can be a child of the app window.
+        let mut win = self
+            .conn
+            .get_input_focus()
+            .map_err(|e| format!("get_input_focus: {e}"))?
+            .reply()
+            .map_err(|e| format!("get_input_focus reply: {e}"))?
+            .focus;
+        for _ in 0..64 {
+            if win <= 1 || win == self.root {
+                return Ok(None);
+            }
+            let (instance, class) = self.window_class(win);
+            if !class.is_empty() || !instance.is_empty() || self.window_pid(win).is_some() {
+                return Ok(Some(win));
+            }
+            let tree = self
+                .conn
+                .query_tree(win)
+                .map_err(|e| format!("query_tree: {e}"))?
+                .reply()
+                .map_err(|e| format!("query_tree reply: {e}"))?;
+            if tree.parent == self.root {
+                return Ok(Some(win));
+            }
+            win = tree.parent;
+        }
+        Ok(None)
+    }
+
+    fn app_for_window(&self, win: Window) -> ActiveApp {
+        let (instance, class) = self.window_class(win);
+        let title = self.window_title(win);
+        // Resolve a friendlier app name from the pid's executable when available.
+        let mut app_name = class.clone();
+        if let Some(pid) = self.window_pid(win) {
+            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                let comm = comm.trim();
+                if !comm.is_empty() {
+                    app_name = comm.to_string();
+                }
+            }
+        }
+        let bundle_id = if !class.is_empty() {
+            class
+        } else if !instance.is_empty() {
+            instance
+        } else {
+            app_name.clone()
+        };
+        ActiveApp {
+            app_name,
+            bundle_id,
+            window_title: title,
+            url: String::new(),
+        }
     }
 
     fn window_title(&self, win: Window) -> String {
@@ -269,24 +328,7 @@ impl Backend for X11Backend {
         let Some(win) = self.active_window()? else {
             return Ok(ActiveApp::default());
         };
-        let (_instance, class) = self.window_class(win);
-        let title = self.window_title(win);
-        // Resolve a friendlier app name from the pid's executable when available.
-        let mut app_name = class.clone();
-        if let Some(pid) = self.window_pid(win) {
-            if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-                let comm = comm.trim();
-                if !comm.is_empty() {
-                    app_name = comm.to_string();
-                }
-            }
-        }
-        Ok(ActiveApp {
-            app_name,
-            bundle_id: class,
-            window_title: title,
-            url: String::new(),
-        })
+        Ok(self.app_for_window(win))
     }
 
     fn get_running_apps(&mut self) -> Result<Vec<RunningApp>> {
@@ -530,5 +572,249 @@ mod tests {
         let map = dvorak_with_us();
         assert_eq!(map.keycode_for(XK_CYRILLIC_EM, 0), None);
         assert_eq!(map.keycode_for(0, 0), None);
+    }
+}
+
+/// Native X11 focus events must not depend on an application's accessibility tree.
+pub struct FocusTracker {
+    state: std::sync::Arc<std::sync::Mutex<FocusState>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct FocusState {
+    backend: X11Backend,
+    events: super::EventSink,
+    active: bool,
+    last: Option<(Option<Window>, serde_json::Value)>,
+    sequence: u64,
+}
+
+impl FocusState {
+    fn announce(&mut self, force: bool) {
+        if !self.active {
+            return;
+        }
+        let window = self.backend.active_window().ok().flatten();
+        let app = window
+            .map(|win| self.backend.app_for_window(win))
+            .unwrap_or_default();
+        let payload = super::active_app_payload(&app);
+        let key = (window, payload.clone());
+        if !force && self.last.as_ref() == Some(&key) {
+            return;
+        }
+        self.last = Some(key);
+        self.sequence += 1;
+        let uuid = format!("x11-focus-{}-{}", std::process::id(), self.sequence);
+        let _ = self
+            .events
+            .send(crate::proto::request("AppInfoUpdate", payload, &uuid));
+    }
+}
+
+impl FocusTracker {
+    pub fn start(events: super::EventSink) -> Result<Self> {
+        use std::sync::{atomic::AtomicBool, Arc, Mutex};
+        let state = Arc::new(Mutex::new(FocusState {
+            backend: X11Backend::connect()?,
+            events,
+            active: true,
+            last: None,
+            sequence: 0,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_state = state.clone();
+        let thread_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("x11-focus-watch".into())
+            .spawn(move || {
+                while !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(mut state) = thread_state.lock() {
+                        state.announce(false);
+                    }
+                    // Bound idle work while keeping app changes responsive during dictation.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+            .map_err(|e| format!("X11 focus thread: {e}"))?;
+        Ok(Self { state, stop })
+    }
+}
+
+impl Drop for FocusTracker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl super::ActiveAppProvider for FocusTracker {
+    fn current(&self) -> Option<ActiveApp> {
+        self.state.lock().ok()?.backend.get_active_app().ok()
+    }
+
+    fn get_running_apps(&self) -> Vec<RunningApp> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut s| s.backend.get_running_apps().ok())
+            .unwrap_or_default()
+    }
+
+    fn set_focus_detection(&self, active: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active = active;
+            state.announce(true);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "x11"
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use std::time::Duration;
+    use x11rb::protocol::xproto::{CreateWindowAux, InputFocus, WindowClass};
+
+    // Run only under a private Xvfb: this test changes the server's input focus.
+    #[test]
+    #[ignore = "requires an isolated X server: xvfb-run cargo test native_focus -- --ignored"]
+    fn native_focus_without_accessibility() {
+        let (conn, screen) = x11rb::connect(None).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let atom = |name: &[u8]| conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let active = atom(b"_NET_ACTIVE_WINDOW");
+        let class = atom(b"WM_CLASS");
+        let title = atom(b"_NET_WM_NAME");
+        let pid = atom(b"_NET_WM_PID");
+        let mut windows = Vec::new();
+        for _ in 0..2 {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                100,
+                100,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+            conn.change_property8(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                win,
+                class,
+                AtomEnum::STRING,
+                b"code\0Code\0",
+            )
+            .unwrap();
+            conn.change_property8(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                win,
+                title,
+                AtomEnum::STRING,
+                b"same title",
+            )
+            .unwrap();
+            conn.map_window(win).unwrap().check().unwrap();
+            windows.push(win);
+        }
+        let focus = |win| {
+            conn.set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
+                .unwrap()
+                .check()
+                .unwrap();
+        };
+        conn.delete_property(root, active).unwrap().check().unwrap();
+        focus(windows[0]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tracker = crate::backend::pick_active_app_provider(tx).unwrap();
+        assert_eq!(tracker.name(), "x11");
+        let next = || {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("focus event")
+        };
+        let app = |event: serde_json::Value| {
+            event["HelperAPIRequest"]["AppInfoUpdate"]["payload"].clone()
+        };
+        assert_eq!(app(next())["bundleId"], "Code");
+        let child = conn.generate_id().unwrap();
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            child,
+            windows[0],
+            0,
+            0,
+            20,
+            20,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        conn.map_window(child).unwrap().check().unwrap();
+        focus(child);
+        assert_eq!(tracker.current().unwrap().bundle_id, "Code");
+        // Identical titles/classes must not suppress a different native window.
+        focus(windows[1]);
+        assert_eq!(app(next())["bundleId"], "Code");
+        tracker.set_focus_detection(false);
+        while rx.try_recv().is_ok() {}
+        focus(windows[0]);
+        assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+        tracker.set_focus_detection(true);
+        assert_eq!(app(next())["bundleId"], "Code");
+        tracker.set_focus_detection(true);
+        assert_eq!(app(next())["bundleId"], "Code");
+        // A classless window still has a stable process identity, never its title.
+        conn.delete_property(windows[0], class).unwrap();
+        conn.change_property32(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            windows[0],
+            pid,
+            AtomEnum::CARDINAL,
+            &[std::process::id()],
+        )
+        .unwrap();
+        conn.sync().unwrap();
+        let name = std::fs::read_to_string(format!("/proc/{}/comm", std::process::id())).unwrap();
+        assert_eq!(app(next())["bundleId"], name.trim());
+        // Missing identity and no focus clear app-specific style context.
+        conn.delete_property(windows[0], pid)
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(app(next())["bundleId"], "");
+        focus(root);
+        assert_eq!(app(next())["windowTitle"], "");
+        // EWMH takes precedence over the input-focus fallback.
+        conn.change_property32(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            root,
+            active,
+            AtomEnum::WINDOW,
+            &[windows[1]],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        assert_eq!(app(next())["bundleId"], "Code");
+        drop(tracker);
+        for win in windows {
+            conn.destroy_window(win).unwrap();
+        }
+        conn.delete_property(root, active).unwrap();
+        conn.sync().unwrap();
     }
 }

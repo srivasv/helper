@@ -11,7 +11,9 @@
 //! GetSelectedTextViaCopy, GetAccessibilityStatus). Everything else is ACK'd as a
 //! safe no-op so the app stays healthy. See README.md for what's next.
 
+mod app_context;
 mod backend;
+mod browser_url;
 mod capture;
 mod keymap;
 mod paste;
@@ -90,6 +92,7 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<Value>();
     let _writer = spawn_fd3_writer(rx);
+    let tx = app_context::route(tx);
     let ipc = IpcWriter { tx: tx.clone() };
     // Global key capture: streams `KeypressEvent`s on fd 3 so push-to-talk and
     // the in-app shortcut recorder work (the app has no hotkey detection of its
@@ -261,6 +264,7 @@ fn handle_request(
                 .get("active")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            app_context::FOCUS_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
             be.set_focus_detection(active);
             log::info!("focus change detector -> {}", if active { "on" } else { "off" });
             ipc.send(&proto::ack(uuid));
@@ -294,6 +298,7 @@ fn handle_request(
         // only from an AppInfoUpdate that arrives while the dictation is
         // running, so re-announce the focused app even if it has not changed.
         "RecordingStarted" => {
+            app_context::FOCUS_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
             be.set_focus_detection(true);
             ipc.send(&proto::ack(uuid));
         }
