@@ -39,6 +39,8 @@ jobs:
         run: |
           cargo test --locked --no-run --message-format=json > /tmp/helper-tests.json
           /usr/bin/python3 edit_observation_test.py /tmp/helper-tests.json
+      - name: Test deep editors and active-window focus discovery
+        run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test focus_discovery_boundaries -- --ignored
       - name: Test rich-text privacy and resource boundaries
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test rich_text_boundaries -- --ignored
       - name: Test Chromium rich-text edits with events and lazy accessibility

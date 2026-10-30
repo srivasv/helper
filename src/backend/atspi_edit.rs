@@ -35,7 +35,8 @@ const IDLE_END: Duration = Duration::from_secs(15);
 /// Never watch one paste longer than this.
 const MAX_WATCH: Duration = Duration::from_secs(120);
 const WALK_TIMEOUT: Duration = Duration::from_secs(8);
-const WALK_DEPTH: usize = 40;
+// Copilot Chat exposes its input 42 levels below the top-level window.
+const WALK_DEPTH: usize = 64;
 const WALK_NODES: usize = 6_000;
 const MAX_REPORT_CHARS: usize = 8_000;
 
@@ -275,32 +276,47 @@ async fn find_focused_field(conn: &zbus::Connection) -> Result<Option<atspi::Obj
             windows.push((active, win));
         }
     }
-    // GTK4 dialogs can expose a focused field without an Active parent.
-    windows.sort_by_key(|(active, _)| !active);
-    search_windows(
-        conn,
-        windows.into_iter().map(|(_, win)| win).collect(),
-        WALK_NODES,
-    )
-    .await
+    search_window_groups(conn, windows, WALK_NODES).await
+}
+
+async fn search_window_groups(
+    conn: &zbus::Connection,
+    windows: Vec<(bool, atspi::ObjectRef)>,
+    mut budget: usize,
+) -> Result<Option<atspi::ObjectRef>, String> {
+    let (active, inactive): (Vec<_>, Vec<_>) = windows.into_iter().partition(|(active, _)| *active);
+    // Chromium retains per-window Focused states even in inactive apps.
+    // GTK/Qt fields can be focused without an Active parent window.
+    for group in [active, inactive] {
+        if let Some(field) = search_windows(
+            conn,
+            group.into_iter().map(|(_, win)| win).collect(),
+            &mut budget,
+        )
+        .await?
+        {
+            return Ok(Some(field));
+        }
+    }
+    Ok(None)
 }
 
 /// Visit one node per window per round so large desktop trees cannot starve apps.
 async fn search_windows(
     conn: &zbus::Connection,
     windows: Vec<atspi::ObjectRef>,
-    mut budget: usize,
+    budget: &mut usize,
 ) -> Result<Option<atspi::ObjectRef>, String> {
     let mut walks: std::collections::VecDeque<_> =
         windows.into_iter().map(|win| vec![(win, 0usize)]).collect();
-    while budget > 0 {
+    while *budget > 0 {
         let Some(mut pending) = walks.pop_front() else {
             break;
         };
         let Some((obj, depth)) = pending.pop() else {
             continue;
         };
-        budget -= 1;
+        *budget -= 1;
         if let Ok(proxy) = obj.as_accessible_proxy(conn).await {
             if let Ok(states) = proxy.get_state().await {
                 if states.contains(State::Focused) && states.contains(State::Editable) {
@@ -577,7 +593,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            search_windows(&client, vec![parent.clone()], 10)
+            search_windows(&client, vec![parent.clone()], &mut 10)
                 .await
                 .unwrap(),
             Some(child.clone())
@@ -598,7 +614,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            search_windows(&client, vec![distractor, child.clone()], 2)
+            search_windows(&client, vec![distractor, child.clone()], &mut 2)
                 .await
                 .unwrap(),
             Some(child.clone())
@@ -608,6 +624,118 @@ mod tests {
             descend_for_focus(&client, &parent, 0, 8, &mut 10).await,
             Some(parent)
         );
+    }
+
+    #[test]
+    #[ignore = "requires a private dbus-run-session"]
+    fn focus_discovery_boundaries() {
+        assert_eq!(
+            std::env::var("WISPR_EDIT_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        runtime().block_on(async {
+            let server = zbus::Connection::session().await.unwrap();
+            let client = zbus::Connection::session().await.unwrap();
+            let object = |path: String| atspi::ObjectRef {
+                name: server.unique_name().unwrap().clone(),
+                path: path.try_into().unwrap(),
+            };
+            // Copilot's input is 42 levels below its top-level window.
+            let nodes: Vec<_> = (0..=42).map(|i| object(format!("/deep/n{i}"))).collect();
+            for (i, node) in nodes.iter().enumerate() {
+                server
+                    .object_server()
+                    .at(
+                        node.path.clone(),
+                        FocusFixture {
+                            editable: i == 42,
+                            children: nodes.get(i + 1).cloned().into_iter().collect(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let target = nodes[42].clone();
+            assert_eq!(
+                search_windows(&client, vec![nodes[0].clone()], &mut 100)
+                    .await
+                    .unwrap(),
+                Some(target.clone()),
+                "deep Copilot field was missed"
+            );
+            let stale = object("/inactive".into());
+            server
+                .object_server()
+                .at(
+                    stale.path.clone(),
+                    FocusFixture {
+                        editable: true,
+                        children: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                search_window_groups(
+                    &client,
+                    vec![(false, stale.clone()), (true, nodes[0].clone())],
+                    100
+                )
+                .await
+                .unwrap(),
+                Some(target.clone()),
+                "inactive stale focus won over active editor"
+            );
+            assert_eq!(
+                search_window_groups(&client, vec![(false, nodes[0].clone())], 100)
+                    .await
+                    .unwrap(),
+                Some(target),
+                "toolkits without Active must still work"
+            );
+            assert_eq!(
+                search_window_groups(&client, vec![(true, nodes[0].clone()), (false, stale)], 5)
+                    .await
+                    .unwrap(),
+                None,
+                "groups must share the node budget"
+            );
+            let too_deep = object("/beyond".into());
+            let mut child = too_deep.clone();
+            server
+                .object_server()
+                .at(
+                    child.path.clone(),
+                    FocusFixture {
+                        editable: true,
+                        children: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+            for i in 0..=WALK_DEPTH {
+                let parent = object(format!("/limit/n{i}"));
+                server
+                    .object_server()
+                    .at(
+                        parent.path.clone(),
+                        FocusFixture {
+                            editable: false,
+                            children: vec![child],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                child = parent;
+            }
+            assert_eq!(
+                search_windows(&client, vec![child], &mut 1000)
+                    .await
+                    .unwrap(),
+                None,
+                "depth limit must remain enforced"
+            );
+        });
     }
 
     #[test]
