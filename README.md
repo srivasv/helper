@@ -189,7 +189,8 @@ The edit-observation regression runs GTK4 Zenity and Qt KDialog with both
 focus-event targeting and bounded fallback search. It checks event delivery,
 corrected text, non-editable focus targets, and fair traversal across windows.
 The helper listens for GTK focused-state changes and Qt legacy focus events
-independently of the compositor's active-app provider. Unsupported or stale
+independently of the compositor's active-app provider. Qt 5's older event-body
+format is accepted alongside the modern AT-SPI format. Unsupported or stale
 accessibles fall back to a bounded search; private fields remain excluded.
 It requires GTK4 Zenity and KDialog in addition to the dependencies above.
 

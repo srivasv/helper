@@ -147,7 +147,7 @@ ApplicationWindow {
             deadline = time.monotonic() + 7
             while "using focus-event target" not in (logs / "observer.log").read_text():
                 assert test.poll() is None, (logs / "observer.log").read_text()
-                assert time.monotonic() < deadline, "Toolkit did not deliver focus events"
+                assert time.monotonic() < deadline, (logs / "observer.log").read_text()
                 key("key", "Tab")
                 key("key", "shift+Tab")
                 key("key", "End")
