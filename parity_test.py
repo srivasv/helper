@@ -9,29 +9,33 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk
 
 if len(sys.argv) == 2:
-    # Never inject into the caller's desktop.
-    raise SystemExit(
-        subprocess.call(
-            [
-                "dbus-run-session",
-                "--",
-                "xvfb-run",
-                "-a",
-                "env",
-                "-u",
-                "WAYLAND_DISPLAY",
-                "-u",
-                "KDE_FULL_SESSION",
-                "XDG_CURRENT_DESKTOP=",
-                "XDG_SESSION_DESKTOP=",
-                "NO_AT_BRIDGE=0",
-                sys.executable,
-                os.path.abspath(__file__),
-                "--isolated",
-                os.path.abspath(sys.argv[1]),
-            ]
+    # Never inject into the caller's desktop or change its accessibility settings.
+    with tempfile.TemporaryDirectory(prefix="wispr-parity-config-") as config:
+        isolated_env = dict(
+            os.environ,
+            XDG_CONFIG_HOME=config,
+            GSETTINGS_BACKEND="memory",
+            XDG_CURRENT_DESKTOP="",
+            XDG_SESSION_DESKTOP="",
+            NO_AT_BRIDGE="0",
         )
-    )
+        for key in ("WAYLAND_DISPLAY", "KDE_FULL_SESSION", "AT_SPI_BUS_ADDRESS"):
+            isolated_env.pop(key, None)
+        raise SystemExit(
+            subprocess.call(
+                [
+                    "dbus-run-session",
+                    "--",
+                    "xvfb-run",
+                    "-a",
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "--isolated",
+                    os.path.abspath(sys.argv[1]),
+                ],
+                env=isolated_env,
+            )
+        )
 if len(sys.argv) != 3 or sys.argv[1] != "--isolated":
     raise SystemExit("usage: parity_test.py <helper-binary>")
 binary = sys.argv[2]

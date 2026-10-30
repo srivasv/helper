@@ -72,14 +72,13 @@ fn parse(value: &str) -> Result<PasteChord, String> {
 /// paste with Ctrl+Shift+V; Ctrl+V never reaches their clipboard handler (it
 /// is quoted-insert in readline, visual-block in vim, etc.).
 pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
-    // Match whole app-id/name components: "warp" must not match Warpinator.
+    // Keep distinctive name variants such as gnome-terminal-server working.
     const TERMINALS: &[&str] = &[
         "kitty",
         "alacritty",
         "ghostty",
         "wezterm",
         "konsole",
-        "foot",
         "gnome-terminal",
         "kgx",
         "ptyxis",
@@ -100,11 +99,9 @@ pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
         "lxterminal",
         "xfce4-terminal",
         "mate-terminal",
-        "warp",
         "waveterm",
-        "rio",
-        "hyper",
     ];
+    const WORDS: &[&str] = &["foot", "warp", "rio", "hyper"];
     const EXACT: &[&str] = &["st", "st-256color", "term", "eterm", "aterm"];
     let name = app_name.to_ascii_lowercase();
     let id = bundle_id.to_ascii_lowercase();
@@ -112,11 +109,13 @@ pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
     matches!(
         id_base,
         "org.gnome.console" | "org.gnome.ptyxis" | "org.gnome.terminal"
-    ) || [&name, &id].iter().any(|value| {
-        value
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-            .any(|part| TERMINALS.contains(&part))
-    }) || EXACT.iter().any(|t| name == *t || id_base == *t)
+    ) || TERMINALS.iter().any(|t| name.contains(t) || id.contains(t))
+        || [&name, &id].iter().any(|value| {
+            value
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|part| WORDS.contains(&part))
+        })
+        || EXACT.iter().any(|t| name == *t || id_base == *t)
 }
 
 #[cfg(test)]
@@ -151,6 +150,10 @@ mod tests {
         assert!(looks_like_terminal("", "com.mitchellh.ghostty.desktop"));
         assert!(looks_like_terminal("Alacritty", "Alacritty"));
         assert!(looks_like_terminal("st", "st-256color"));
+        assert!(looks_like_terminal(
+            "gnome-terminal-server",
+            "gnome-terminal-server"
+        ));
     }
 
     #[test]
