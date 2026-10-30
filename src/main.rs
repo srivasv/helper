@@ -96,6 +96,7 @@ fn main() {
     // own — see capture/mod.rs). XInput2 on X11, evdev elsewhere. The returned
     // handle answers `CheckStaleKeys`. Independent of the focus/injection backend.
     let held_keys = capture::spawn(tx.clone());
+    let _field_focus = backend::atspi_focus::start();
     // The backend gets its own sink for async helper-initiated events (focus).
     let mut be = backend::detect(tx);
     log::info!("backend = {}", be.name());
