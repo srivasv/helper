@@ -1,5 +1,6 @@
 //! Normalize Linux identity and enrich app IPC without delaying key events.
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc,
@@ -31,6 +32,11 @@ pub fn identity(id: &str) -> &str {
             "com.google.Chrome"
         }
         "chromium" | "chromium-browser" | "org.chromium.chromium" => "com.google.Chrome",
+        "vivaldi"
+        | "vivaldi-bin"
+        | "vivaldi-stable"
+        | "vivaldi-snapshot"
+        | "com.vivaldi.vivaldi" => "com.vivaldi.Vivaldi",
         "firefox" | "firefox-esr" | "org.mozilla.firefox" => "org.mozilla.firefox",
         "brave" | "brave-browser" | "com.brave.browser" => "com.brave.Browser",
         "msedge" | "microsoft-edge" | "microsoft-edge-stable" => "com.microsoft.edgemac",
@@ -44,6 +50,7 @@ pub fn is_browser(id: &str) -> bool {
         "com.google.Chrome"
             | "org.chromium.Chromium"
             | "org.mozilla.firefox"
+            | "com.vivaldi.Vivaldi"
             | "com.brave.Browser"
             | "com.microsoft.edgemac"
     )
@@ -134,8 +141,13 @@ fn app_loop(
 ) {
     let mut last: Option<(u64, Value)> = None;
     let mut sequence = 0u64;
+    let mut pending = VecDeque::new();
     loop {
-        let (seq, mut message, polling) = match input.recv_timeout(Duration::from_millis(250)) {
+        let incoming = pending
+            .pop_front()
+            .map(Ok)
+            .unwrap_or_else(|| input.recv_timeout(Duration::from_millis(250)));
+        let (seq, mut message, polling) = match incoming {
             Ok((seq, message)) => (seq, message, false),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -156,9 +168,31 @@ fn app_loop(
         let id = payload["bundleId"].as_str().unwrap_or("").to_string();
         let browser = is_browser(&id);
         if browser {
-            let title = payload["windowTitle"].as_str().unwrap_or("");
-            let url = read_url(&id, title);
-            payload["url"] = Value::String(url.unwrap_or_default());
+            let title = payload["windowTitle"].as_str().unwrap_or("").to_owned();
+            let url = read_url(&id, &title).unwrap_or_default();
+            payload["url"] = Value::String(url.clone());
+            // Queries queued during this scan can use its freshly validated result.
+            // Never reuse it across focus generations or a different window title.
+            for _ in 0..64 {
+                let Ok((query_seq, mut query)) = input.try_recv() else {
+                    break;
+                };
+                let response = query.get("HelperAPIResponse").is_some();
+                let query_payload = app_payload(&mut query).expect("routed app message");
+                if response
+                    && query_seq == seq
+                    && seq == generation.load(Ordering::SeqCst)
+                    && query_payload["bundleId"].as_str() == Some(id.as_str())
+                    && query_payload["windowTitle"].as_str() == Some(title.as_str())
+                {
+                    query_payload["url"] = Value::String(url.clone());
+                    if output.send(query).is_err() {
+                        return;
+                    }
+                } else {
+                    pending.push_back((query_seq, query));
+                }
+            }
         }
         if seq != generation.load(Ordering::SeqCst) {
             if event {
@@ -237,6 +271,95 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_query_shares_fresh_focus_scan() {
+        let (output, received) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let calls = Arc::new(AtomicU64::new(0));
+        let reads = calls.clone();
+        let input = route_with_reader(output, move |_, _| {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            }
+            Some("linkedin.com".into())
+        });
+        input.send(event("google-chrome")).unwrap();
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response = crate::proto::response(
+            "ActiveAppInfo",
+            serde_json::json!({"payload": {"appName":"google-chrome",
+                "bundleId":"google-chrome","windowTitle":"same","url":""}}),
+            "query-overlap",
+        );
+        input.send(response).unwrap();
+        let key = crate::proto::request("KeypressEvent", serde_json::json!({}), "barrier");
+        input.send(key.clone()).unwrap();
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)).unwrap(), key);
+        release.send(()).unwrap();
+        let mut reply = None;
+        for _ in 0..2 {
+            let message = received.recv_timeout(Duration::from_secs(1)).unwrap();
+            if message["HelperAPIResponse"]["uuid"] == "query-overlap" {
+                reply = Some(message);
+            }
+        }
+        assert_eq!(
+            reply.unwrap()["HelperAPIResponse"]["ActiveAppInfo"]["payload"]["url"],
+            "linkedin.com"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a queued query must not repeat the same scan"
+        );
+    }
+
+    #[test]
+    fn overlapping_query_does_not_share_another_window() {
+        let (output, received) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let input = route_with_reader(output, move |_, title| {
+            if title == "same" {
+                let _ = started.send(());
+                let _ = blocked.recv();
+                Some("linkedin.com".into())
+            } else {
+                Some("app.slack.com".into())
+            }
+        });
+        input.send(event("google-chrome")).unwrap();
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        input
+            .send(crate::proto::response(
+                "ActiveAppInfo",
+                serde_json::json!({"payload": {"bundleId":"google-chrome",
+                "windowTitle":"another", "url":""}}),
+                "other-window",
+            ))
+            .unwrap();
+        let barrier = crate::proto::request("KeypressEvent", serde_json::json!({}), "barrier");
+        input.send(barrier.clone()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            barrier
+        );
+        release.send(()).unwrap();
+        let mut response = None;
+        for _ in 0..2 {
+            let message = received.recv_timeout(Duration::from_secs(1)).unwrap();
+            if message["HelperAPIResponse"]["uuid"] == "other-window" {
+                response = Some(message);
+            }
+        }
+        assert_eq!(
+            response.unwrap()["HelperAPIResponse"]["ActiveAppInfo"]["payload"]["url"],
+            "app.slack.com"
+        );
+    }
+
+    #[test]
     fn polling_updates_same_title_and_clears_failed_urls() {
         let (output, received) = mpsc::channel();
         let mut reads = 0;
@@ -288,6 +411,48 @@ mod tests {
             received.recv_timeout(Duration::from_secs(1)).unwrap(),
             correction
         );
+    }
+
+    #[test]
+    #[ignore = "requires a focused browser and WISPR_EXPECTED_BROWSER/HOST"]
+    fn live_browser_message_worker() {
+        let browser = std::env::var("WISPR_EXPECTED_BROWSER").unwrap();
+        let host = std::env::var("WISPR_EXPECTED_HOST").unwrap();
+        let (output, received) = mpsc::channel();
+        let input = route(output);
+        let mut failures = 0;
+        for i in 0..20 {
+            let uid = format!("live-query-{i}");
+            let response = crate::proto::response(
+                "ActiveAppInfo",
+                serde_json::json!({"payload":{"bundleId":browser,"windowTitle":"same","url":""}}),
+                &uid,
+            );
+            let started = std::time::Instant::now();
+            input.send(response).unwrap();
+            let got = received.recv_timeout(Duration::from_secs(2)).unwrap();
+            let elapsed = started.elapsed().as_millis();
+            let matched = got["HelperAPIResponse"]["ActiveAppInfo"]["payload"]["url"] == host;
+            eprintln!("Worker sample: matched={matched} elapsed_ms={elapsed}");
+            failures += usize::from(!matched || elapsed >= 300);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(failures, 0);
+    }
+
+    #[test]
+    fn vivaldi_identifiers_enable_browser_url_detection() {
+        for id in [
+            "vivaldi",
+            "vivaldi-bin",
+            "vivaldi-stable",
+            "vivaldi-snapshot",
+            "com.vivaldi.Vivaldi",
+        ] {
+            assert_eq!(identity(id), "com.vivaldi.Vivaldi");
+            assert!(is_browser(id));
+        }
+        assert!(!is_browser("not-vivaldi"));
     }
 
     #[test]
