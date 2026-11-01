@@ -309,6 +309,17 @@ async fn search_windows(
     windows: Vec<atspi::ObjectRef>,
     budget: &mut usize,
 ) -> Result<Option<atspi::ObjectRef>, String> {
+    // Chromium can answer in one call instead of thousands of tree round-trips.
+    if *budget > 0 {
+        for window in &windows {
+            if let Ok(Some(field)) =
+                tokio::time::timeout(Duration::from_millis(100), collection_focus(conn, window))
+                    .await
+            {
+                return Ok(Some(field));
+            }
+        }
+    }
     let mut walks: std::collections::VecDeque<_> =
         windows.into_iter().map(|win| vec![(win, 0usize)]).collect();
     while *budget > 0 {
@@ -342,6 +353,51 @@ async fn search_windows(
         }
     }
     Ok(None)
+}
+
+async fn collection_focus(
+    conn: &zbus::Connection,
+    window: &atspi::ObjectRef,
+) -> Option<atspi::ObjectRef> {
+    use atspi::proxy::collection::CollectionProxy;
+    use atspi::{MatchType, SortOrder};
+
+    let proxy = CollectionProxy::builder(conn)
+        .destination(window.name.clone())
+        .ok()?
+        .path(window.path.clone())
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let states = (State::Focused | State::Editable).bits();
+    let states = [states as i32, (states >> 32) as i32];
+    let rule: atspi::MatchArgs<'_> = (
+        &states,
+        MatchType::All,
+        Default::default(),
+        MatchType::All,
+        &[],
+        MatchType::All,
+        &[],
+        MatchType::All,
+        false,
+    );
+    let field = proxy
+        .get_matches(&rule, SortOrder::Canonical, 1, true)
+        .await
+        .ok()?
+        .into_iter()
+        .next()?;
+    let states = field
+        .as_accessible_proxy(conn)
+        .await
+        .ok()?
+        .get_state()
+        .await
+        .ok()?;
+    (states.contains(State::Focused) && states.contains(State::Editable)).then_some(field)
 }
 
 fn observable_role(role: Option<Role>) -> bool {
@@ -561,6 +617,40 @@ mod tests {
         }
     }
 
+    type OwnedMatchArgs = (
+        Vec<i32>,
+        atspi::MatchType,
+        std::collections::HashMap<String, String>,
+        atspi::MatchType,
+        Vec<i32>,
+        atspi::MatchType,
+        Vec<String>,
+        atspi::MatchType,
+        bool,
+    );
+
+    struct FocusCollection(atspi::ObjectRef, Duration);
+
+    #[zbus::interface(name = "org.a11y.atspi.Collection")]
+    impl FocusCollection {
+        async fn get_matches(
+            &self,
+            rule: OwnedMatchArgs,
+            sort: atspi::SortOrder,
+            count: i32,
+            traverse: bool,
+        ) -> Vec<atspi::ObjectRef> {
+            let states = (State::Focused | State::Editable).bits();
+            assert_eq!(rule.0, &[states as i32, (states >> 32) as i32]);
+            assert_eq!(rule.1, atspi::MatchType::All);
+            assert_eq!(sort, atspi::SortOrder::Canonical);
+            assert_eq!(count, 1);
+            assert!(traverse);
+            tokio::time::sleep(self.1).await;
+            vec![self.0.clone()]
+        }
+    }
+
     async fn check_noneditable_focus() {
         let server = zbus::Connection::session().await.unwrap();
         let client = zbus::Connection::session().await.unwrap();
@@ -736,6 +826,40 @@ mod tests {
                     .unwrap(),
                 None,
                 "depth limit must remain enforced"
+            );
+            // Collection avoids exhausting the walk budget before a deep editor.
+            server
+                .object_server()
+                .at(
+                    nodes[0].path.clone(),
+                    FocusCollection(nodes[42].clone(), Duration::ZERO),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                search_window_groups(&client, vec![(true, nodes[0].clone())], 5)
+                    .await
+                    .unwrap(),
+                Some(nodes[42].clone()),
+                "focused field query must bypass the slow tree walk"
+            );
+            let collection = server
+                .object_server()
+                .interface::<_, FocusCollection>(nodes[0].path.clone())
+                .await
+                .unwrap();
+            collection.get_mut().await.0 = nodes[0].clone();
+            assert!(
+                collection_focus(&client, &nodes[0]).await.is_none(),
+                "a noneditable collection result must not be accepted"
+            );
+            collection.get_mut().await.1 = Duration::from_millis(200);
+            assert_eq!(
+                search_windows(&client, vec![nodes[0].clone()], &mut 100)
+                    .await
+                    .unwrap(),
+                Some(nodes[42].clone()),
+                "a stalled collection must fall back to the bounded walk"
             );
         });
     }
