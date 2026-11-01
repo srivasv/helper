@@ -24,10 +24,18 @@ pub(super) struct Snapshot {
 }
 
 pub(super) async fn read(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot> {
+    read_mode(conn, root, false).await
+}
+
+pub(super) async fn read_selected(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot> {
+    read_mode(conn, root, true).await
+}
+
+async fn read_mode(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> Result<Snapshot> {
     tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
-        let first = snapshot(conn, root).await?;
+        let first = snapshot(conn, root, selected).await?;
         // No atomic snapshot API: require two consistent reads across a changing DOM.
-        let second = snapshot(conn, root).await?;
+        let second = snapshot(conn, root, selected).await?;
         if first != second {
             return Err("editor changed during snapshot".into());
         }
@@ -37,7 +45,7 @@ pub(super) async fn read(conn: &zbus::Connection, root: &ObjectRef) -> Result<Sn
     .map_err(|_| "editor snapshot timed out".to_string())?
 }
 
-async fn snapshot(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot> {
+async fn snapshot(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> Result<Snapshot> {
     let acc = root.as_accessible_proxy(conn).await.map_err(err)?;
     let parent = acc.parent().await.map_err(err)?;
     let mut reader = Reader {
@@ -45,6 +53,7 @@ async fn snapshot(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot>
         seen: HashSet::new(),
         chars_read: 0,
         expanded: false,
+        selected,
     };
     let (chars, _) = reader.node(root, None, 0).await?;
     let text = TextProxy::builder(conn)
@@ -58,7 +67,7 @@ async fn snapshot(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot>
         .map_err(err)?;
     // shortcut: expanded offsets are not root caret offsets; require a unique paste
     // until toolkit-independent caret mapping is available.
-    let caret = if reader.expanded {
+    let caret = if reader.expanded || selected {
         -1
     } else {
         text.caret_offset().await.unwrap_or(-1)
@@ -94,6 +103,7 @@ struct Reader<'a> {
     seen: HashSet<ObjectRef>,
     chars_read: usize,
     expanded: bool,
+    selected: bool,
 }
 
 impl Reader<'_> {
@@ -145,6 +155,23 @@ impl Reader<'_> {
             if n < 0 || n as usize > MAX_CHARS.saturating_sub(self.chars_read) {
                 return Err("editor text budget exceeded".into());
             }
+            let range = if self.selected {
+                let count: i32 = text
+                    .inner()
+                    .call("GetNSelections", &())
+                    .await
+                    .map_err(err)?;
+                if count != 1 {
+                    return Err("ambiguous or absent embedded selection".into());
+                }
+                let (start, end) = text.get_selection(0).await.map_err(err)?;
+                if start < 0 || end <= start || end > n {
+                    return Err("invalid embedded selection range".into());
+                }
+                start as usize..end as usize
+            } else {
+                0..n as usize
+            };
             let raw: Vec<char> = text.get_text(0, n).await.map_err(err)?.chars().collect();
             if raw.len() != n as usize {
                 return Err("text length changed during read".into());
@@ -152,7 +179,7 @@ impl Reader<'_> {
             self.chars_read += raw.len();
             let mut out = Vec::new();
             let mut previous_block = false;
-            for (offset, ch) in raw.iter().enumerate() {
+            for (offset, ch) in raw.iter().enumerate().take(range.end).skip(range.start) {
                 if *ch != '\u{fffc}' {
                     out.push(*ch);
                     previous_block = false;
@@ -219,6 +246,19 @@ impl Reader<'_> {
                     return Err("embedded link changed during read".into());
                 }
             }
+            if self.selected {
+                let count: i32 = text
+                    .inner()
+                    .call("GetNSelections", &())
+                    .await
+                    .map_err(err)?;
+                if count != 1
+                    || text.get_selection(0).await.map_err(err)?
+                        != (range.start as i32, range.end as i32)
+                {
+                    return Err("selection changed during read".into());
+                }
+            }
             if text.character_count().await.map_err(err)? != n
                 || text.get_text(0, n).await.map_err(err)?.chars().ne(raw)
             {
@@ -250,6 +290,7 @@ mod tests {
         states: atspi::StateSet,
         text: String,
         count: Option<i32>,
+        selection: Option<(i32, i32)>,
         links: Vec<ObjectRef>,
         target: ObjectRef,
         start: i32,
@@ -260,6 +301,7 @@ mod tests {
         stall: bool,
         blur: bool,
         detach: bool,
+        change_selection: bool,
     }
     type Shared = Arc<Mutex<Node>>;
     struct Accessible(Shared);
@@ -279,6 +321,12 @@ mod tests {
     struct Text(Shared);
     #[zbus::interface(name = "org.a11y.atspi.Text")]
     impl Text {
+        fn get_n_selections(&self) -> i32 {
+            i32::from(self.0.lock().unwrap().selection.is_some())
+        }
+        fn get_selection(&self, _index: i32) -> (i32, i32) {
+            self.0.lock().unwrap().selection.unwrap_or((0, 0))
+        }
         #[zbus(property)]
         fn character_count(&self) -> i32 {
             let n = self.0.lock().unwrap();
@@ -292,6 +340,9 @@ mod tests {
             let (text, stall) = {
                 let mut n = self.0.lock().unwrap();
                 n.reads += 1;
+                if n.change_selection {
+                    n.selection = None;
+                }
                 if n.blur {
                     n.states.remove(State::Focused);
                 }
@@ -379,6 +430,7 @@ mod tests {
             },
             text: text.into(),
             count: None,
+            selection: Some((0, text.chars().count() as i32)),
             links: vec![],
             target: obj.clone(),
             start: 0,
@@ -389,6 +441,7 @@ mod tests {
             stall: false,
             blur: false,
             detach: false,
+            change_selection: false,
         }));
         conn.object_server()
             .at(obj.path.clone(), Accessible(node.clone()))
@@ -441,6 +494,43 @@ mod tests {
             }
         );
         assert_eq!(duplicate.lock().unwrap().reads, 0);
+        r.lock().unwrap().selection = Some((0, 1));
+        a.lock().unwrap().selection = Some((6, 10));
+        b.lock().unwrap().reads = 0;
+        assert_eq!(
+            read_selected(&client, &root).await.unwrap().chars,
+            "日本 🦀".chars().collect::<Vec<_>>(),
+            "only selected characters inside the embedded paragraph may be returned"
+        );
+        assert_eq!(b.lock().unwrap().reads, 0, "unselected paragraph was read");
+        r.lock().unwrap().selection = Some((1, 2));
+        b.lock().unwrap().selection = Some((0, 3));
+        assert_eq!(
+            read_selected(&client, &root).await.unwrap().chars,
+            "wor".chars().collect::<Vec<_>>()
+        );
+        r.lock().unwrap().selection = Some((0, 2));
+        assert_eq!(
+            read_selected(&client, &root).await.unwrap().chars,
+            "日本 🦀\nwor".chars().collect::<Vec<_>>()
+        );
+        for range in [None, Some((-1, 2)), Some((0, 99)), Some((4, 2))] {
+            a.lock().unwrap().selection = range;
+            assert!(
+                read_selected(&client, &root).await.is_err(),
+                "invalid child selection"
+            );
+        }
+        *r.lock().unwrap() = good.clone();
+        *a.lock().unwrap() = child_good.clone();
+        b.lock().unwrap().selection = Some((0, 5));
+        a.lock().unwrap().change_selection = true;
+        assert!(
+            read_selected(&client, &root).await.is_err(),
+            "selection changed during read"
+        );
+        *a.lock().unwrap() = child_good.clone();
+
         // Recreated paragraph IDs are fine between stable snapshots.
         let (replacement, _) = fixture(
             &server,
@@ -551,7 +641,7 @@ mod tests {
             last = data;
         }
         // Use snapshot without its wall-clock cap to specifically exercise node budget.
-        assert!(snapshot(&client, &root)
+        assert!(snapshot(&client, &root, false)
             .await
             .unwrap_err()
             .contains("budget"));

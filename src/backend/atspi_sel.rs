@@ -290,6 +290,16 @@ async fn read_selection(conn: &Connection, obj: &ObjectRef) -> Result<Option<Sel
         }
     }
 
+    if selected.contains('\u{fffc}') {
+        // Root offsets name embedded objects; their Text ranges identify the words.
+        return match super::atspi_text::read_selected(conn, obj).await {
+            Ok(snapshot) => Ok(Some(Selection {
+                selected_text: snapshot.chars.into_iter().collect(),
+                ..Selection::default()
+            })),
+            Err(_) => Ok(None),
+        };
+    }
     if selected.is_empty() {
         return Ok(None);
     }
@@ -351,21 +361,21 @@ mod tests {
         }
     }
 
-    struct SelectedText;
+    struct SelectedText(&'static str);
     #[zbus::interface(name = "org.a11y.atspi.Text")]
     impl SelectedText {
         fn get_n_selections(&self) -> i32 {
             1
         }
         fn get_selection(&self, _index: i32) -> (i32, i32) {
-            (0, 8)
+            (0, self.0.chars().count() as i32)
         }
         fn get_text(&self, _start: i32, _end: i32) -> String {
-            "selected".into()
+            self.0.into()
         }
         #[zbus(property)]
         fn character_count(&self) -> i32 {
-            8
+            self.0.chars().count() as i32
         }
     }
 
@@ -386,7 +396,13 @@ mod tests {
             std::env::var("WISPR_SELECTION_TEST_LIVE").as_deref(),
             Ok("1")
         );
-        assert!(get_selection().unwrap().is_some(), "no selected text found");
+        let selected = get_selection().unwrap().expect("no selected text found");
+        assert!(!selected.selected_text.is_empty());
+        assert!(!selected.selected_text.contains('\u{fffc}'));
+        eprintln!(
+            "selected {} characters without object markers",
+            selected.selected_text.chars().count()
+        );
     }
 
     #[test]
@@ -444,7 +460,7 @@ mod tests {
                     .unwrap();
                 server
                     .object_server()
-                    .at(nodes[42].path.clone(), SelectedText)
+                    .at(nodes[42].path.clone(), SelectedText("selected"))
                     .await
                     .unwrap();
                 let field = find_focused(&client).await.unwrap().expect("deep editor");
@@ -456,6 +472,19 @@ mod tests {
                         .selected_text,
                     "selected"
                 );
+                let text = server
+                    .object_server()
+                    .interface::<_, SelectedText>(field.path.clone())
+                    .await
+                    .unwrap();
+                for embedded in ["\u{fffc}", "before \u{fffc} after"] {
+                    text.get_mut().await.0 = embedded;
+                    assert!(
+                        read_selection(&client, &field).await.unwrap().is_none(),
+                        "embedded rich-text placeholders must trigger the copy fallback"
+                    );
+                }
+                text.get_mut().await.0 = "selected";
                 assert!(!is_terminal_widget(&client, &field).await);
                 for (class, expected) in [
                     ("xterm-helper-textarea", true),

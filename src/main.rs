@@ -164,6 +164,7 @@ fn handle_request(
 
         // ---- core paste / keys ----
         "PasteText" => {
+            let paste_started = Instant::now();
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
             let app = be.get_active_app().unwrap_or_default();
@@ -174,11 +175,25 @@ fn handle_request(
                 app.app_name, app.bundle_id
             );
             paste::set_focused_is_terminal(is_terminal);
-            match be.paste_text(text, html) {
+            let result = be.paste_text(text, html);
+            let paste_id = payload.get("pasteId").and_then(Value::as_str).unwrap_or("");
+            let mut outcome = json!({
+                "success": result.is_ok(),
+                "timeElapsedMs": paste_started.elapsed().as_millis() as u64,
+            });
+            if !paste_id.is_empty() {
+                outcome["pasteId"] = json!(paste_id);
+            }
+            if let Err(reason) = &result {
+                outcome["reason"] = json!(reason);
+            }
+            // Transforms wait for this event; an ACK alone is not completion.
+            ipc.send(&proto::request("PasteOutcome", json!({ "payload": outcome }),
+                &format!("paste-{uuid}")));
+            match result {
                 Ok(()) => {
                     ipc.send(&proto::ack(uuid));
                     // Observe the field so corrected words can be auto-learned.
-                    let paste_id = payload.get("pasteId").and_then(Value::as_str).unwrap_or("");
                     backend::atspi_edit::watch(paste_id.to_string(), text.to_string(), ipc.tx.clone());
                 }
                 Err(e) => {
@@ -316,6 +331,90 @@ fn handle_request(
         other => {
             log::debug!("unhandled command '{other}' (uuid={uuid}) — ACK no-op");
             ipc.send(&proto::ack(uuid));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct PasteBackend(bool);
+    impl Backend for PasteBackend {
+        fn paste_text(&mut self, _: &str, _: Option<&str>) -> backend::Result<()> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err("injection failed".into())
+            }
+        }
+        fn get_active_app(&mut self) -> backend::Result<backend::ActiveApp> {
+            Ok(backend::ActiveApp {
+                app_name: "konsole".into(),
+                ..Default::default()
+            })
+        }
+        fn simulate_key_press(&mut self, _: u32, _: &[String]) -> backend::Result<()> {
+            unreachable!()
+        }
+        fn get_running_apps(&mut self) -> backend::Result<Vec<backend::RunningApp>> {
+            unreachable!()
+        }
+        fn get_selected_text(&mut self) -> backend::Result<backend::Selection> {
+            unreachable!()
+        }
+        fn accessibility_status(&mut self) -> bool {
+            false
+        }
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+    impl capture::HeldKeys for PasteBackend {
+        fn held_vks(&self) -> std::collections::HashSet<u32> {
+            Default::default()
+        }
+    }
+
+    #[test]
+    fn paste_attempt_reports_correlated_outcome() {
+        for success in [true, false] {
+            let (tx, rx) = mpsc::channel();
+            let msg = Incoming::parse(
+                &json!({"HelperAPIRequest": {
+                    "uuid": "request-1", "PasteText": {"payload": {
+                        "text": "", "pasteId": "paste-1"
+                    }}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            handle_request(
+                &mut PasteBackend(success),
+                &PasteBackend(success),
+                &IpcWriter { tx },
+                &msg,
+                Instant::now(),
+            );
+            let messages: Vec<_> = rx.try_iter().collect();
+            let outcomes: Vec<_> = messages
+                .iter()
+                .filter_map(|m| {
+                    m.get("HelperAPIRequest")?
+                        .get("PasteOutcome")?
+                        .get("payload")
+                })
+                .collect();
+            assert_eq!(outcomes.len(), 1, "ACK alone leaves transforms waiting");
+            assert_eq!(outcomes[0]["pasteId"], "paste-1");
+            assert_eq!(outcomes[0]["success"], success);
+            assert!(outcomes[0]["timeElapsedMs"].is_number());
+            if !success {
+                assert_eq!(outcomes[0]["reason"], "injection failed");
+            }
+            assert!(messages
+                .iter()
+                .any(|m| m["HelperAPIResponse"]["uuid"] == "request-1"));
         }
     }
 }
