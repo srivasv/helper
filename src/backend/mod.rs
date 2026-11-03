@@ -7,6 +7,7 @@
 //! not a rewrite.
 
 pub mod atspi_app;
+pub mod atspi_context;
 pub mod atspi_edit;
 pub mod atspi_focus;
 pub mod atspi_sel;
