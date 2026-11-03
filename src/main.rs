@@ -247,6 +247,9 @@ fn handle_request(
         },
 
         // ---- selection / accessibility ----
+        "GetTextBoxInfo" => {
+            backend::atspi_context::query(ipc.tx.clone(), uuid.to_string());
+        }
         "GetSelectedTextViaCopy" => match be.get_selected_text() {
             Ok(s) => ipc.send(&proto::response(
                 "SelectedTextViaCopy",
@@ -310,6 +313,10 @@ fn handle_request(
         }
 
         // ---- lifecycle ----
+        "DictationStart" => {
+            backend::atspi_context::start(ipc.tx.clone(), uuid.to_string());
+            ipc.send(&proto::ack(uuid));
+        }
         // Electron resets the dictation's app at every start and refills it
         // only from an AppInfoUpdate that arrives while the dictation is
         // running, so re-announce the focused app even if it has not changed.
@@ -374,6 +381,29 @@ mod tests {
         fn held_vks(&self) -> std::collections::HashSet<u32> {
             Default::default()
         }
+    }
+
+    #[test]
+    fn textbox_query_returns_context_instead_of_a_noop_ack() {
+        let (tx, rx) = mpsc::channel();
+        let msg = Incoming::parse(
+            &json!({"HelperAPIRequest": {"uuid": "context-query", "GetTextBoxInfo": true}})
+                .to_string(),
+        )
+        .unwrap();
+        handle_request(
+            &mut PasteBackend(false),
+            &PasteBackend(false),
+            &IpcWriter { tx },
+            &msg,
+            Instant::now(),
+        );
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(4)).unwrap();
+        assert!(
+            reply["HelperAPIResponse"]["TextBoxInfo"]["payload"].is_object(),
+            "ACK alone leaves the client without preceding text on resume"
+        );
+        assert_eq!(reply["HelperAPIResponse"]["uuid"], "context-query");
     }
 
     #[test]

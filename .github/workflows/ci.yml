@@ -43,6 +43,8 @@ jobs:
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test focus_discovery_boundaries -- --ignored
       - name: Test rich-text privacy and resource boundaries
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test rich_text_boundaries -- --ignored
+      - name: Test dictation context active-window privacy
+        run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test context_requires_an_active_window -- --ignored
       - name: Test Chromium rich-text edits with events and lazy accessibility
         run: |
           CHROMIUM_BIN="$(command -v google-chrome)" /usr/bin/python3 \

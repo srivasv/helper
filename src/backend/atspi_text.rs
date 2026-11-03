@@ -15,12 +15,13 @@ const MAX_DEPTH: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 
 type Result<T> = std::result::Result<T, String>;
-type NodeRead<'a> = Pin<Box<dyn Future<Output = Result<(Vec<char>, Role)>> + 'a>>;
+type NodeRead<'a> = Pin<Box<dyn Future<Output = Result<(Vec<char>, Role, i32)>> + 'a>>;
 
 #[derive(Debug, PartialEq)]
 pub(super) struct Snapshot {
     pub chars: Vec<char>,
     pub caret: i32,
+    expanded: bool,
 }
 
 pub(super) async fn read(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot> {
@@ -31,31 +32,25 @@ pub(super) async fn read_selected(conn: &zbus::Connection, root: &ObjectRef) -> 
     read_mode(conn, root, true).await
 }
 
-async fn read_mode(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> Result<Snapshot> {
-    tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
-        let first = snapshot(conn, root, selected).await?;
-        // No atomic snapshot API: require two consistent reads across a changing DOM.
-        let second = snapshot(conn, root, selected).await?;
-        if first != second {
-            return Err("editor changed during snapshot".into());
-        }
-        Ok(second)
-    })
-    .await
-    .map_err(|_| "editor snapshot timed out".to_string())?
+/// Read caret-relative context without copying or guessing expanded DOM offsets.
+pub(super) async fn context(conn: &zbus::Connection, root: &ObjectRef) -> Result<super::Selection> {
+    let first = context_snapshot(conn, root).await?;
+    let second = context_snapshot(conn, root).await?;
+    if first != second {
+        return Err("context changed during read".into());
+    }
+    let (snapshot, start, end) = second;
+    split_context(&snapshot.chars, start, end)
 }
 
-async fn snapshot(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> Result<Snapshot> {
-    let acc = root.as_accessible_proxy(conn).await.map_err(err)?;
-    let parent = acc.parent().await.map_err(err)?;
-    let mut reader = Reader {
-        conn,
-        seen: HashSet::new(),
-        chars_read: 0,
-        expanded: false,
-        selected,
-    };
-    let (chars, _) = reader.node(root, None, 0).await?;
+async fn context_snapshot(
+    conn: &zbus::Connection,
+    root: &ObjectRef,
+) -> Result<(Snapshot, i32, i32)> {
+    let snapshot = snapshot(conn, root, false, true).await?;
+    if snapshot.caret < 0 {
+        return Err("caret unavailable for editor".into());
+    }
     let text = TextProxy::builder(conn)
         .destination(root.name.as_str())
         .map_err(err)?
@@ -65,9 +60,83 @@ async fn snapshot(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> 
         .build()
         .await
         .map_err(err)?;
-    // shortcut: expanded offsets are not root caret offsets; require a unique paste
-    // until toolkit-independent caret mapping is available.
-    let caret = if reader.expanded || selected {
+    let count: i32 = text
+        .inner()
+        .call("GetNSelections", &())
+        .await
+        .map_err(err)?;
+    if snapshot.expanded && count != 0 {
+        return Err("selection offsets unavailable for expanded editor".into());
+    }
+    let (start, end) = match count {
+        0 => (snapshot.caret, snapshot.caret),
+        1 => text.get_selection(0).await.map_err(err)?,
+        _ => return Err("ambiguous editor selection".into()),
+    };
+    Ok((snapshot, start, end))
+}
+
+fn split_context(chars: &[char], start: i32, end: i32) -> Result<super::Selection> {
+    // Bound both copies of the text in TextBoxInfo below the 30,000-char IPC cap.
+    const LIMIT: usize = 500;
+    if start < 0 || end < start || end as usize > chars.len() || (end - start) as usize > LIMIT {
+        return Err("invalid or oversized context selection".into());
+    }
+    let (start, end) = (start as usize, end as usize);
+    let before = start.saturating_sub(LIMIT);
+    let after = (end + LIMIT).min(chars.len());
+    Ok(super::Selection {
+        before_text: chars[before..start].iter().collect(),
+        selected_text: chars[start..end].iter().collect(),
+        after_text: chars[end..after].iter().collect(),
+        contents: chars[before..after].iter().collect(),
+    })
+}
+
+async fn read_mode(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> Result<Snapshot> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+        let first = snapshot(conn, root, selected, false).await?;
+        // No atomic snapshot API: require two consistent reads across a changing DOM.
+        let second = snapshot(conn, root, selected, false).await?;
+        if first != second {
+            return Err("editor changed during snapshot".into());
+        }
+        Ok(second)
+    })
+    .await
+    .map_err(|_| "editor snapshot timed out".to_string())?
+}
+
+async fn snapshot(
+    conn: &zbus::Connection,
+    root: &ObjectRef,
+    selected: bool,
+    map_caret: bool,
+) -> Result<Snapshot> {
+    let acc = root.as_accessible_proxy(conn).await.map_err(err)?;
+    let parent = acc.parent().await.map_err(err)?;
+    let mut reader = Reader {
+        conn,
+        seen: HashSet::new(),
+        chars_read: 0,
+        expanded: false,
+        selected,
+        map_caret,
+    };
+    let (chars, _, mapped_caret) = reader.node(root, None, 0).await?;
+    let text = TextProxy::builder(conn)
+        .destination(root.name.as_str())
+        .map_err(err)?
+        .path(root.path.as_str())
+        .map_err(err)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .map_err(err)?;
+    // Correction matching keeps its unique-paste rule for expanded editors.
+    let caret = if map_caret {
+        mapped_caret
+    } else if reader.expanded || selected {
         -1
     } else {
         text.caret_offset().await.unwrap_or(-1)
@@ -76,7 +145,11 @@ async fn snapshot(conn: &zbus::Connection, root: &ObjectRef, selected: bool) -> 
     if acc.parent().await.map_err(err)? != parent {
         return Err("editor was reparented".into());
     }
-    Ok(Snapshot { chars, caret })
+    Ok(Snapshot {
+        chars,
+        caret,
+        expanded: reader.expanded,
+    })
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -104,6 +177,7 @@ struct Reader<'a> {
     chars_read: usize,
     expanded: bool,
     selected: bool,
+    map_caret: bool,
 }
 
 impl Reader<'_> {
@@ -155,6 +229,14 @@ impl Reader<'_> {
             if n < 0 || n as usize > MAX_CHARS.saturating_sub(self.chars_read) {
                 return Err("editor text budget exceeded".into());
             }
+            let raw_caret = if self.map_caret {
+                text.caret_offset().await.map_err(err)?
+            } else {
+                -1
+            };
+            if raw_caret < -1 || raw_caret > n {
+                return Err("invalid caret offset".into());
+            }
             let range = if self.selected {
                 let count: i32 = text
                     .inner()
@@ -178,9 +260,13 @@ impl Reader<'_> {
             }
             self.chars_read += raw.len();
             let mut out = Vec::new();
+            let mut caret = -1;
             let mut previous_block = false;
             for (offset, ch) in raw.iter().enumerate().take(range.end).skip(range.start) {
                 if *ch != '\u{fffc}' {
+                    if raw_caret == offset as i32 {
+                        caret = out.len() as i32;
+                    }
                     out.push(*ch);
                     previous_block = false;
                     continue;
@@ -225,7 +311,8 @@ impl Reader<'_> {
                     return Err("ambiguous embedded link".into());
                 }
                 let child = proxy.get_object(0).await.map_err(err)?;
-                let (chars, child_role) = self.node(&child, Some(obj), depth + 1).await?;
+                let (chars, child_role, child_caret) =
+                    self.node(&child, Some(obj), depth + 1).await?;
                 let block = child_role == Role::Paragraph;
                 if previous_block
                     && block
@@ -233,6 +320,9 @@ impl Reader<'_> {
                     && chars.first() != Some(&'\n')
                 {
                     out.push('\n');
+                }
+                if raw_caret == offset as i32 && child_caret >= 0 {
+                    caret = out.len() as i32 + child_caret;
                 }
                 out.extend(chars);
                 previous_block = block;
@@ -245,6 +335,12 @@ impl Reader<'_> {
                 {
                     return Err("embedded link changed during read".into());
                 }
+            }
+            if raw_caret == n {
+                caret = out.len() as i32;
+            }
+            if self.map_caret && text.caret_offset().await.map_err(err)? != raw_caret {
+                return Err("caret changed during read".into());
             }
             if self.selected {
                 let count: i32 = text
@@ -273,7 +369,7 @@ impl Reader<'_> {
             } else {
                 check_root(&acc).await?;
             }
-            Ok((out, role))
+            Ok((out, role, caret))
         })
     }
 }
@@ -283,6 +379,21 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn context_ranges_are_bounded_and_never_guess_invalid_offsets() {
+        let chars: Vec<char> = "é🦀 ".repeat(1000).chars().collect();
+        let text = split_context(&chars, 1500, 1500).unwrap();
+        assert_eq!(text.before_text.chars().count(), 500);
+        assert_eq!(text.after_text.chars().count(), 500);
+        assert_eq!(text.contents.chars().count(), 1000);
+        assert!(text.selected_text.is_empty());
+        for (start, end) in [(-1, 0), (2, 1), (0, 3001), (0, 501)] {
+            assert!(split_context(&chars, start, end).is_err());
+        }
+        let empty = split_context(&[], 0, 0).unwrap();
+        assert!(empty.contents.is_empty());
+    }
+
     #[derive(Clone)]
     struct Node {
         role: Role,
@@ -290,6 +401,7 @@ mod tests {
         states: atspi::StateSet,
         text: String,
         count: Option<i32>,
+        caret: Option<i32>,
         selection: Option<(i32, i32)>,
         links: Vec<ObjectRef>,
         target: ObjectRef,
@@ -302,6 +414,7 @@ mod tests {
         blur: bool,
         detach: bool,
         change_selection: bool,
+        move_caret: bool,
     }
     type Shared = Arc<Mutex<Node>>;
     struct Accessible(Shared);
@@ -334,12 +447,16 @@ mod tests {
         }
         #[zbus(property)]
         fn caret_offset(&self) -> i32 {
-            self.character_count()
+            let n = self.0.lock().unwrap();
+            n.caret.unwrap_or(n.text.chars().count() as i32)
         }
         async fn get_text(&self, _start: i32, _end: i32) -> String {
             let (text, stall) = {
                 let mut n = self.0.lock().unwrap();
                 n.reads += 1;
+                if n.move_caret {
+                    n.caret = Some(n.caret.unwrap_or(0) + 1);
+                }
                 if n.change_selection {
                     n.selection = None;
                 }
@@ -430,6 +547,7 @@ mod tests {
             },
             text: text.into(),
             count: None,
+            caret: None,
             selection: Some((0, text.chars().count() as i32)),
             links: vec![],
             target: obj.clone(),
@@ -442,6 +560,7 @@ mod tests {
             blur: false,
             detach: false,
             change_selection: false,
+            move_caret: false,
         }));
         conn.object_server()
             .at(obj.path.clone(), Accessible(node.clone()))
@@ -469,6 +588,35 @@ mod tests {
             name: server.unique_name().unwrap().clone(),
             path: "/null".try_into().unwrap(),
         };
+        let (editor, data) = fixture(
+            &server,
+            "/context_editor",
+            &null,
+            Role::Entry,
+            "We were discussing ",
+        )
+        .await;
+        data.lock().unwrap().selection = None;
+        let initial = context(&client, &editor).await.unwrap();
+        assert_eq!(initial.before_text, "We were discussing ");
+        assert_eq!(initial.after_text, "");
+        // Resume must read the actual field, including edits made between segments.
+        data.lock().unwrap().text = "日本 🦀 and more".into();
+        data.lock().unwrap().caret = Some(4);
+        let resumed = context(&client, &editor).await.unwrap();
+        assert_eq!(resumed.before_text, "日本 🦀");
+        assert_eq!(resumed.after_text, " and more");
+        data.lock().unwrap().selection = Some((5, 8));
+        let selected = context(&client, &editor).await.unwrap();
+        assert_eq!(selected.before_text, "日本 🦀 ");
+        assert_eq!(selected.selected_text, "and");
+        assert_eq!(selected.after_text, " more");
+        for role in [Role::PasswordText, Role::Terminal] {
+            data.lock().unwrap().role = role;
+            let reads = data.lock().unwrap().reads;
+            assert!(context(&client, &editor).await.is_err());
+            assert_eq!(data.lock().unwrap().reads, reads);
+        }
         let (root, r) = fixture(&server, "/editor", &null, Role::Entry, "\u{fffc}\u{fffc}").await;
         let (p1, a) = fixture(
             &server,
@@ -490,9 +638,66 @@ mod tests {
             result,
             Snapshot {
                 chars: "hello 日本 🦀\nworld".chars().collect(),
-                caret: -1
+                caret: -1,
+                expanded: true,
             }
         );
+        // Chromium's root caret names the paragraph placeholder; the paragraph
+        // supplies its own character offset, rather than a flattened root offset.
+        r.lock().unwrap().selection = None;
+        r.lock().unwrap().caret = Some(1);
+        a.lock().unwrap().caret = Some(-1);
+        b.lock().unwrap().caret = Some(5);
+        let resumed = context(&client, &root)
+            .await
+            .expect("rich-text dictation must retain caret context");
+        assert_eq!(resumed.before_text, "hello 日本 🦀\nworld");
+        assert_eq!(resumed.after_text, "");
+        b.lock().unwrap().caret = Some(2);
+        let middle = context(&client, &root).await.unwrap();
+        assert_eq!(middle.before_text, "hello 日本 🦀\nwo");
+        assert_eq!(middle.after_text, "rld");
+        r.lock().unwrap().caret = Some(0);
+        a.lock().unwrap().caret = Some(6);
+        b.lock().unwrap().caret = Some(-1);
+        let first = context(&client, &root).await.unwrap();
+        assert_eq!(first.before_text, "hello ");
+        assert_eq!(first.after_text, "日本 🦀\nworld");
+        a.lock().unwrap().caret = Some(-1);
+        assert!(
+            context(&client, &root).await.is_err(),
+            "missing child caret"
+        );
+        a.lock().unwrap().caret = Some(99);
+        assert!(
+            context(&client, &root).await.is_err(),
+            "invalid child caret"
+        );
+        a.lock().unwrap().caret = Some(6);
+        a.lock().unwrap().move_caret = true;
+        assert!(
+            context(&client, &root).await.is_err(),
+            "caret changed during read"
+        );
+        a.lock().unwrap().move_caret = false;
+        a.lock().unwrap().caret = Some(6);
+        r.lock().unwrap().selection = Some((0, 1));
+        assert!(
+            context(&client, &root).await.is_err(),
+            "unmapped rich selection"
+        );
+        let (span, span_data) =
+            fixture(&server, "/caret_span", &p1, Role::Text, "hello 日本 🦀").await;
+        span_data.lock().unwrap().caret = Some(7);
+        r.lock().unwrap().selection = None;
+        a.lock().unwrap().text = "\u{fffc}".into();
+        a.lock().unwrap().links = vec![span];
+        a.lock().unwrap().caret = Some(0);
+        let nested = context(&client, &root).await.unwrap();
+        assert_eq!(nested.before_text, "hello 日");
+        assert_eq!(nested.after_text, "本 🦀\nworld");
+        *r.lock().unwrap() = good.clone();
+        *a.lock().unwrap() = child_good.clone();
         assert_eq!(duplicate.lock().unwrap().reads, 0);
         r.lock().unwrap().selection = Some((0, 1));
         a.lock().unwrap().selection = Some((6, 10));
@@ -641,7 +846,7 @@ mod tests {
             last = data;
         }
         // Use snapshot without its wall-clock cap to specifically exercise node budget.
-        assert!(snapshot(&client, &root, false)
+        assert!(snapshot(&client, &root, false, false)
             .await
             .unwrap_err()
             .contains("budget"));

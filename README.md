@@ -40,6 +40,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | `SetFocusChangeDetectorState` → `AppInfoUpdate` | ⬜ (TODO: `PropertyNotify`) | ✅ **KDE** — focus events on fd 3, gated & deduped |
 | `GetSelectedTextViaCopy` | ⚠️ Ctrl+C copy-probe | ⚠️ Ctrl+C copy-probe |
 | `GetAccessibilityStatus` | ✅ (connection live) | ✅ (uinput live) |
+| `DictationStart` / `GetTextBoxInfo` → `TextBoxInfo` | AT-SPI caret/selection context | Same reader; unavailable for private fields or unmappable rich-text carets |
 | `PasteText` → `UpdateEditedText` (auto-learn corrected words) | ✅ AT-SPI | ✅ AT-SPI — watches the pasted span, reports the edited text on focus loss / 15 s idle. New pastes cancel older observations. GTK/Qt work out of the box; Chromium/Electron apps need `--force-renderer-accessibility`. Terminals, password fields, unknown roles and ambiguous pasted spans are skipped. |
 | everything else (intervals/BLE/panel/analytics…) | ACK no-op | ACK no-op |
 
