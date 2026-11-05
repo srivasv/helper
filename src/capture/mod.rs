@@ -21,6 +21,7 @@
 //! both paths converge on the same VK and the same emission code here.
 
 mod evdev;
+mod synergy;
 mod xinput;
 
 use std::collections::HashSet;
@@ -52,6 +53,7 @@ impl HeldKeys for NoHeldKeys {
 /// handle for stale-key queries. Prefers the no-privilege XInput2 path on a true
 /// X11 session, falling back to evdev (Wayland, or X11 where XInput2 fails).
 pub fn spawn(events: EventSink) -> Box<dyn HeldKeys> {
+    let events = synergy::route(events);
     if is_true_x11_session() {
         match xinput::start(events.clone()) {
             Ok(held) => {

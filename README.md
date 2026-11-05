@@ -255,3 +255,33 @@ Run the isolated protocol and deep-editor regression without touching the deskto
 WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- \
   cargo test selection_discovers_deep_active_editor -- --ignored
 ```
+
+## Synergy 3 shortcuts
+
+The global keyboard listener pauses while Synergy 3 controls another computer.
+
+- Physical keyboards, OpenDeck virtual keyboards, and mouse shortcut buttons
+  pass through the same gate. Keys already sent to Wispr are released when
+  control leaves Linux, and remote presses are discarded.
+- The gate reads Synergy's existing `entering screen` / `leaving screen` INFO
+  records from `$XDG_STATE_HOME/Synergy/synergy.jsonl` (default:
+  `~/.local/state/Synergy/synergy.jsonl`). No Synergy configuration edit is needed.
+- Only records from the running user's current `synergy-core` lifetime count.
+  Startup also checks the previous rotated log; live rotation retains focus.
+- With Synergy stopped, capture behaves normally. If Synergy is running but
+  focus is unknown or its log is unreadable, shortcuts pause with a warning.
+  Restore INFO logging, then move to the remote screen and back to resynchronize.
+- This integration requires Synergy 3's JSONL format and INFO logging. Synergy's
+  log delivery is asynchronous, so instantaneous switching still needs live
+  validation. Deskflow, Barrier, and other log formats are not supported.
+
+Run the passive live capture check while moving Linux → remote → Linux and
+trying both the physical keyboard and OpenDeck on each screen:
+
+```bash
+cargo test live_synergy_capture -- --ignored --nocapture
+```
+
+The 120-second check injects no input and prints event counts, never typed text.
+It compares ungated evdev input against the actual gated capture pipeline and
+requires remote suppression plus working local input before and after switching.
