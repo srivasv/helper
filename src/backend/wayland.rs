@@ -224,11 +224,31 @@ fn run_with_stdin(prog: &str, args: &[&str], input: &str) -> Result<()> {
 /// can stall the read), which would otherwise freeze every subsequent command.
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+fn capture_result(
+    prog: &str,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<String> {
+    // An empty clipboard is a valid starting point for the copy probe.
+    if prog == "wl-paste"
+        && status.code() == Some(1)
+        && stdout.is_empty()
+        && stderr == b"Nothing is copied\n"
+    {
+        return Ok(String::new());
+    }
+    if !status.success() {
+        return Err(format!("{prog} exited with {status}"));
+    }
+    Ok(String::from_utf8_lossy(stdout).into_owned())
+}
+
 fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
     let mut child = Command::new(prog)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn {prog}: {e}"))?;
 
@@ -241,6 +261,13 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
+    let mut stderr = child.stderr.take().ok_or("no stderr pipe")?;
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = stderr_tx.send(buf);
+    });
 
     let deadline = Instant::now() + CAPTURE_TIMEOUT;
     loop {
@@ -249,10 +276,10 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
                 let buf = rx
                     .recv_timeout(Duration::from_millis(200))
                     .unwrap_or_default();
-                if !status.success() {
-                    return Err(format!("{prog} exited with {status}"));
-                }
-                return Ok(String::from_utf8_lossy(&buf).into_owned());
+                let stderr = stderr_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .unwrap_or_default();
+                return capture_result(prog, status, &buf, &stderr);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -264,5 +291,55 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
             }
             Err(e) => return Err(format!("wait {prog}: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_read_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn empty_clipboard_is_valid_before_copying_a_selection() {
+        assert_eq!(
+            capture_result(
+                "wl-paste",
+                std::process::ExitStatus::from_raw(1 << 8),
+                b"",
+                b"Nothing is copied\n",
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn clipboard_connection_and_format_errors_still_fail() {
+        for stderr in [
+            b"Failed to connect to a Wayland server\n".as_slice(),
+            b"No suitable type of content copied\n",
+        ] {
+            assert!(capture_result(
+                "wl-paste",
+                std::process::ExitStatus::from_raw(1 << 8),
+                b"",
+                stderr
+            )
+            .is_err());
+        }
+        assert!(capture_result(
+            "wl-paste",
+            std::process::ExitStatus::from_raw(2 << 8),
+            b"",
+            b"Nothing is copied\n"
+        )
+        .is_err());
+        assert!(capture_result(
+            "wl-paste",
+            std::process::ExitStatus::from_raw(1 << 8),
+            b"partial",
+            b"Nothing is copied\n"
+        )
+        .is_err());
     }
 }
