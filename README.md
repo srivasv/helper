@@ -268,6 +268,8 @@ The global keyboard listener pauses while Synergy 3 controls another computer.
   `~/.local/state/Synergy/synergy.jsonl`). No Synergy configuration edit is needed.
 - Only records from the running user's current `synergy-core` lifetime count.
   Startup also checks the previous rotated log; live rotation retains focus.
+- The core's `starting core` record establishes local focus before the first
+  screen switch, so shortcuts work immediately after a reboot.
 - With Synergy stopped, capture behaves normally. If Synergy is running but
   focus is unknown or its log is unreadable, shortcuts pause with a warning.
   Restore INFO logging, then move to the remote screen and back to resynchronize.

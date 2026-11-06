@@ -152,7 +152,7 @@ impl FocusLog {
         if self.reported != Some(local) {
             if self.local.is_none() {
                 log::warn!(
-                    "Synergy focus unknown: pausing shortcuts until a screen entry/exit is logged"
+                    "Synergy focus unknown: pausing shortcuts until startup or a screen entry/exit is logged"
                 );
             } else {
                 log::info!(
@@ -226,6 +226,8 @@ fn focus_record(line: &str, since: &str) -> Option<bool> {
         return None;
     }
     match record["msg"].as_str()? {
+        // A fresh core starts locally before any screen transition is logged.
+        "starting core" => Some(true),
         "entering screen" => Some(true),
         "leaving screen" => Some(false),
         _ => None,
@@ -300,6 +302,18 @@ mod tests {
 
     #[test]
     fn focus_records_require_core_exact_message_and_current_process_time() {
+        assert_eq!(focus_record(&record("starting core"), ""), Some(true));
+        assert_eq!(
+            focus_record(&record("starting core"), "2026-11-05T19:00:00"),
+            None
+        );
+        assert_eq!(
+            focus_record(
+                &record("starting core").replace("\"source\":\"core\"", "\"source\":\"service\""),
+                ""
+            ),
+            None
+        );
         assert_eq!(
             focus_record(&record("leaving screen"), "2026-11-05T17:00:00"),
             Some(false)
@@ -326,11 +340,23 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("synergy.jsonl");
         let previous = dir.join("synergy.jsonl.1");
-        std::fs::write(&previous, record("leaving screen")).unwrap();
+        std::fs::write(&previous, record("starting core")).unwrap();
         std::fs::write(&path, "").unwrap();
         let mut focus = FocusLog::new(path.clone());
         focus.core = Some((dir.clone(), "2026-11-05T17:00:00".into()));
         focus.next_scan = std::time::Instant::now() + Duration::from_secs(3600);
+        assert!(
+            focus.local(),
+            "startup enables shortcuts before the first screen switch"
+        );
+        let mut previous_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&previous)
+            .unwrap();
+        previous_file
+            .write_all(record("leaving screen").as_bytes())
+            .unwrap();
+        focus.tail = None;
         assert!(!focus.local(), "bootstrap remote focus from rotated log");
         let entry = record("entering screen");
         let mut file = std::fs::OpenOptions::new()
