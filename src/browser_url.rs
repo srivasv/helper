@@ -149,6 +149,15 @@ async fn browser_windows(
 }
 
 async fn read_window(conn: &zbus::Connection, window: &ObjectRef, browser: &str) -> Option<String> {
+    let (_, url) = document_in_window(conn, window, browser).await?;
+    site(&url)
+}
+
+pub(crate) async fn document_in_window(
+    conn: &zbus::Connection,
+    window: &ObjectRef,
+    browser: &str,
+) -> Option<(ObjectRef, String)> {
     // Compositor caches may retain the previous tab's title. Trust the active
     // accessible window, then verify its title did not change during this read.
     let title = window
@@ -205,7 +214,6 @@ async fn read_window(conn: &zbus::Connection, window: &ObjectRef, browser: &str)
         .build()
         .await
         .ok()?;
-    let result = site(&url)?;
     let frame = window.as_accessible_proxy(conn).await.ok()?;
     if !frame.get_state().await.ok()?.contains(State::Active) {
         return None;
@@ -216,7 +224,7 @@ async fn read_window(conn: &zbus::Connection, window: &ObjectRef, browser: &str)
     if p.get_attribute_value(&attribute).await.ok()? != url {
         return None;
     }
-    Some(result)
+    Some((doc, url))
 }
 
 enum BrowserNode {

@@ -143,12 +143,138 @@ async fn probe() -> Result<Option<Selection>, String> {
         .map_err(|e| format!("a11y bus connect: {e}"))?;
     let conn = a11y.connection();
 
-    let Some(focused) = find_focused(conn).await? else {
-        log::debug!("atspi: no focused accessible found");
-        return Ok(None);
-    };
+    selection_on_connection(conn).await
+}
 
-    read_selection(conn, &focused).await
+async fn selection_on_connection(conn: &Connection) -> Result<Option<Selection>, String> {
+    // Reserve time for read-only pages when a focus walk stalls elsewhere.
+    if let Ok(Ok(Some(focused))) =
+        tokio::time::timeout(Duration::from_millis(800), find_focused(conn)).await
+    {
+        if let Some(selection) = read_selection(conn, &focused).await? {
+            return Ok(Some(selection));
+        }
+    }
+    // Browser page selections need not focus an editable (or any Text) widget.
+    web_selection(conn).await
+}
+
+async fn web_selection(conn: &Connection) -> Result<Option<Selection>, String> {
+    let root = desktop_root(conn).await?;
+    for app in root.get_children().await.unwrap_or_default() {
+        let Ok(app) = app.as_accessible_proxy(conn).await else {
+            continue;
+        };
+        let name = tokio::time::timeout(Duration::from_millis(10), app.name())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        if !crate::app_context::is_browser(crate::app_context::identity(&name)) {
+            continue;
+        }
+        for window in app.get_children().await.unwrap_or_default() {
+            let Ok(proxy) = window.as_accessible_proxy(conn).await else {
+                continue;
+            };
+            if !proxy
+                .get_state()
+                .await
+                .is_ok_and(|s| s.contains(State::Active))
+            {
+                continue;
+            }
+            let browser = crate::app_context::identity(&name);
+            if let Some((document, _)) =
+                crate::browser_url::document_in_window(conn, &window, browser).await
+            {
+                if let Some(selection) = read_document_selection(conn, &document).await {
+                    if proxy
+                        .get_state()
+                        .await
+                        .is_ok_and(|s| s.contains(State::Active))
+                    {
+                        return Ok(Some(selection));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+type DocumentRange = (ObjectRef, i32, ObjectRef, i32, bool);
+
+async fn read_document_selection(conn: &Connection, document: &ObjectRef) -> Option<Selection> {
+    let proxy = zbus::Proxy::new(
+        conn,
+        document.name.as_str(),
+        document.path.as_str(),
+        "org.a11y.atspi.Document",
+    )
+    .await
+    .ok()?;
+    let ranges: Vec<DocumentRange> = proxy.call("GetTextSelections", &()).await.ok()?;
+    let [(start_obj, start, end_obj, end, _)] = ranges.as_slice() else {
+        return None;
+    };
+    // shortcut: cross-object ranges use the copy fallback until safely flattened.
+    if start_obj != end_obj || *start < 0 || end <= start || end - start > 100_000 {
+        return None;
+    }
+    // Document endpoints must stay inside this page and its application.
+    let mut obj = start_obj.clone();
+    for _ in 0..64 {
+        if obj.name != document.name {
+            return None;
+        }
+        if obj == *document {
+            break;
+        }
+        obj = obj
+            .as_accessible_proxy(conn)
+            .await
+            .ok()?
+            .parent()
+            .await
+            .ok()?;
+    }
+    if obj != *document {
+        return None;
+    }
+    let endpoint = start_obj.as_accessible_proxy(conn).await.ok()?;
+    if matches!(
+        endpoint.get_role().await.ok()?,
+        atspi::Role::PasswordText | atspi::Role::Terminal | atspi::Role::Invalid
+    ) || endpoint.get_state().await.ok()?.contains(State::Defunct)
+    {
+        return None;
+    }
+    let text = TextProxy::builder(conn)
+        .destination(start_obj.name.as_str())
+        .ok()?
+        .path(start_obj.path.as_str())
+        .ok()?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    if *end > text.character_count().await.ok()? {
+        return None;
+    }
+    let selected = text.get_text(*start, *end).await.ok()?;
+    let after: Vec<DocumentRange> = proxy.call("GetTextSelections", &()).await.ok()?;
+    if after != ranges
+        || selected.chars().count() != (end - start) as usize
+        || selected.contains('\u{fffc}')
+        || text.get_text(*start, *end).await.ok()? != selected
+    {
+        return None;
+    }
+    Some(Selection {
+        selected_text: selected,
+        ..Selection::default()
+    })
 }
 
 /// The accessibility hierarchy root: the registry's desktop object. All running
@@ -328,6 +454,7 @@ mod tests {
     struct Node {
         focused: bool,
         active: bool,
+        document: bool,
         children: Vec<ObjectRef>,
         class: String,
         parent: ObjectRef,
@@ -335,6 +462,10 @@ mod tests {
 
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl Node {
+        #[zbus(property)]
+        fn name(&self) -> &str {
+            "Vivaldi"
+        }
         fn get_state(&self) -> atspi::StateSet {
             let mut states = atspi::StateSet::empty();
             if self.focused {
@@ -344,6 +475,7 @@ mod tests {
             if self.active {
                 states.insert(State::Active);
             }
+            states.insert(State::Showing);
             states
         }
         fn get_children(&self) -> Vec<ObjectRef> {
@@ -357,7 +489,11 @@ mod tests {
             self.parent.clone()
         }
         fn get_role(&self) -> atspi::Role {
-            atspi::Role::Entry
+            if self.document {
+                atspi::Role::DocumentWeb
+            } else {
+                atspi::Role::Entry
+            }
         }
     }
 
@@ -370,13 +506,137 @@ mod tests {
         fn get_selection(&self, _index: i32) -> (i32, i32) {
             (0, self.0.chars().count() as i32)
         }
-        fn get_text(&self, _start: i32, _end: i32) -> String {
-            self.0.into()
+        fn get_text(&self, start: i32, end: i32) -> String {
+            self.0
+                .chars()
+                .skip(start as usize)
+                .take((end - start) as usize)
+                .collect()
         }
         #[zbus(property)]
         fn character_count(&self) -> i32 {
             self.0.chars().count() as i32
         }
+    }
+
+    struct WebDocument(Vec<DocumentRange>);
+    #[zbus::interface(name = "org.a11y.atspi.Document")]
+    impl WebDocument {
+        fn get_attribute_value(&self, _name: &str) -> &str {
+            "file:///selection.html"
+        }
+        fn get_text_selections(&self) -> Vec<DocumentRange> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a private dbus-run-session"]
+    fn selection_reads_unfocused_readonly_web_document() {
+        assert_eq!(
+            std::env::var("WISPR_EDIT_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = zbus::Connection::session().await.unwrap();
+                server
+                    .request_name("org.a11y.atspi.Registry")
+                    .await
+                    .unwrap();
+                let client = zbus::Connection::session().await.unwrap();
+                let object = |path: String| ObjectRef {
+                    name: server.unique_name().unwrap().clone(),
+                    path: path.try_into().unwrap(),
+                };
+                let nodes: Vec<_> = (0..=20).map(|i| object(format!("/web/n{i}"))).collect();
+                for (i, node) in nodes.iter().enumerate() {
+                    server
+                        .object_server()
+                        .at(
+                            node.path.clone(),
+                            Node {
+                                focused: false,
+                                active: i == 1,
+                                document: i == 19,
+                                class: String::new(),
+                                parent: nodes[i.saturating_sub(1)].clone(),
+                                children: nodes.get(i + 1).cloned().into_iter().collect(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                server
+                    .object_server()
+                    .at(
+                        "/org/a11y/atspi/accessible/root",
+                        Node {
+                            focused: false,
+                            active: false,
+                            document: false,
+                            class: String::new(),
+                            parent: nodes[0].clone(),
+                            children: vec![nodes[0].clone()],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                server
+                    .object_server()
+                    .at(
+                        nodes[20].path.clone(),
+                        SelectedText("before selected 日本 🦀 after"),
+                    )
+                    .await
+                    .unwrap();
+                server
+                    .object_server()
+                    .at(
+                        nodes[19].path.clone(),
+                        WebDocument(vec![(nodes[20].clone(), 7, nodes[20].clone(), 20, false)]),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    selection_on_connection(&client)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .selected_text,
+                    "selected 日本 🦀"
+                );
+                let document = server
+                    .object_server()
+                    .interface::<_, WebDocument>(nodes[19].path.clone())
+                    .await
+                    .unwrap();
+                for range in [
+                    (nodes[20].clone(), -1, nodes[20].clone(), 20, false),
+                    (nodes[20].clone(), 7, nodes[20].clone(), 99, false),
+                    (nodes[20].clone(), 7, nodes[20].clone(), 7, false),
+                    (nodes[20].clone(), 7, nodes[19].clone(), 20, false),
+                    (nodes[0].clone(), 0, nodes[0].clone(), 1, false),
+                ] {
+                    document.get_mut().await.0 = vec![range];
+                    assert!(read_document_selection(&client, &nodes[19]).await.is_none());
+                }
+                document.get_mut().await.0 =
+                    vec![(nodes[20].clone(), 7, nodes[20].clone(), 20, false)];
+                let window = server
+                    .object_server()
+                    .interface::<_, Node>(nodes[1].path.clone())
+                    .await
+                    .unwrap();
+                window.get_mut().await.active = false;
+                assert!(
+                    selection_on_connection(&client).await.unwrap().is_none(),
+                    "inactive browser selections must not become command context"
+                );
+            });
     }
 
     #[test]
@@ -396,6 +656,7 @@ mod tests {
             std::env::var("WISPR_SELECTION_TEST_LIVE").as_deref(),
             Ok("1")
         );
+        let _ = env_logger::try_init();
         let selected = get_selection().unwrap().expect("no selected text found");
         assert!(!selected.selected_text.is_empty());
         assert!(!selected.selected_text.contains('\u{fffc}'));
@@ -438,6 +699,7 @@ mod tests {
                                 parent: nodes[i.saturating_sub(1)].clone(),
                                 focused: i == 42,
                                 active: i == 1,
+                                document: false,
                                 children: nodes.get(i + 1).cloned().into_iter().collect(),
                             },
                         )
@@ -453,6 +715,7 @@ mod tests {
                             parent: nodes[0].clone(),
                             focused: false,
                             active: false,
+                            document: false,
                             children: vec![nodes[0].clone()],
                         },
                     )
