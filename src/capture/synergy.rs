@@ -169,10 +169,17 @@ impl FocusLog {
             if self.tail.as_ref().is_none_or(|t| t.identity != identity) {
                 if let Some(old) = &mut self.tail {
                     old.update(since, &mut self.local)?;
+                    if old.offset < old.file.metadata()?.len() {
+                        return Ok(());
+                    }
                 } else if let Ok(previous) = File::open(self.path.with_extension("jsonl.1")) {
                     Tail::new(previous)?.update(since, &mut self.local)?;
                 }
-                self.tail = Some(Tail::new(file)?);
+                let tail = Tail::new(file)?;
+                if tail.offset > 0 {
+                    self.local = None;
+                }
+                self.tail = Some(tail);
             }
             self.tail.as_mut().unwrap().update(since, &mut self.local)
         })();
@@ -199,9 +206,13 @@ impl FocusLog {
                 }
             }
         }
-        let local = self.local.unwrap_or(false);
+        let caught_up = self
+            .tail
+            .as_ref()
+            .is_none_or(|tail| tail.file.metadata().is_ok_and(|m| tail.offset >= m.len()));
+        let local = self.local.filter(|_| caught_up).unwrap_or(false);
         if self.reported != Some(local) {
-            if self.local.is_none() {
+            if self.local.is_none() || !caught_up {
                 log::warn!(
                     "Synergy focus unknown: pausing shortcuts until startup or a screen entry/exit is logged"
                 );
@@ -522,6 +533,22 @@ mod tests {
         );
         drop(resumed);
         std::fs::remove_file(&previous).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(record("leaving screen").as_bytes()).unwrap();
+        let mut catching_up = reader();
+        assert!(
+            !catching_up.local(),
+            "never forward keys before unseen records are replayed"
+        );
+        assert!(
+            !catching_up.local(),
+            "the late screen exit must leave capture paused"
+        );
         let mut other_core = reader();
         other_core.core.as_mut().unwrap().1 = "2026-11-05T19:00:00".into();
         assert!(
