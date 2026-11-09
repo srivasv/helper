@@ -271,6 +271,11 @@ The global keyboard listener pauses while Synergy 3 controls another computer.
   and reads the open log while its replacement is temporarily absent.
 - The core's `starting core` record establishes local focus before the first
   screen switch, so shortcuts work immediately after a reboot.
+- A private checkpoint in `$XDG_STATE_HOME/wispr-flow/synergy-focus.json`
+  preserves known focus across helper restarts after focus records rotate out.
+  It is accepted only for the same Synergy core lifetime and a retained log
+  inode with matching bytes at the saved cursor. Unseen records are replayed
+  before any keys are forwarded; missing continuity still pauses shortcuts.
 - With Synergy stopped, capture behaves normally. If Synergy is running but
   focus is unknown or its log is unreadable, shortcuts pause with a warning.
   Restore INFO logging, then move to the remote screen and back to resynchronize.

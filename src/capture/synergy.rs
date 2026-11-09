@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -19,7 +19,12 @@ pub(super) fn route(events: EventSink) -> EventSink {
         let state_home = std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-        let mut focus = state_home.map(|p| FocusLog::new(p.join("Synergy/synergy.jsonl")));
+        let mut focus = state_home.map(|p| {
+            FocusLog::new(
+                p.join("Synergy/synergy.jsonl"),
+                p.join("wispr-flow/synergy-focus.json"),
+            )
+        });
         loop {
             let local = focus.as_mut().is_none_or(|f| f.local());
             gate.set_local(local, &events);
@@ -95,10 +100,13 @@ struct FocusLog {
     tail: Option<Tail>,
     local: Option<bool>,
     reported: Option<bool>,
+    checkpoint_path: PathBuf,
+    checkpoint: Option<Checkpoint>,
+    restore_attempted: bool,
 }
 
 impl FocusLog {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, checkpoint_path: PathBuf) -> Self {
         Self {
             path,
             core: None,
@@ -106,6 +114,9 @@ impl FocusLog {
             tail: None,
             local: None,
             reported: None,
+            checkpoint_path,
+            checkpoint: None,
+            restore_attempted: false,
         }
     }
 
@@ -118,6 +129,8 @@ impl FocusLog {
                 self.core = core;
                 self.tail = None;
                 self.local = None;
+                self.checkpoint = None;
+                self.restore_attempted = false;
             }
         }
         let Some((proc_path, since)) = &self.core else {
@@ -125,6 +138,17 @@ impl FocusLog {
         };
         if !proc_path.exists() {
             return true;
+        }
+        if !self.restore_attempted {
+            self.restore_attempted = true;
+            if let Some((checkpoint, tail)) =
+                Checkpoint::restore(&self.checkpoint_path, &self.path, &self.core)
+            {
+                self.local = Some(checkpoint.local);
+                self.tail = Some(tail);
+                self.checkpoint = Some(checkpoint);
+                log::debug!("Synergy focus checkpoint restored");
+            }
         }
         // shortcut: Synergy 3 INFO JSONL logs are the focus interface; replace
         // this adapter when Synergy exposes active-screen state over IPC.
@@ -145,10 +169,17 @@ impl FocusLog {
             if self.tail.as_ref().is_none_or(|t| t.identity != identity) {
                 if let Some(old) = &mut self.tail {
                     old.update(since, &mut self.local)?;
+                    if old.offset < old.file.metadata()?.len() {
+                        return Ok(());
+                    }
                 } else if let Ok(previous) = File::open(self.path.with_extension("jsonl.1")) {
                     Tail::new(previous)?.update(since, &mut self.local)?;
                 }
-                self.tail = Some(Tail::new(file)?);
+                let tail = Tail::new(file)?;
+                if tail.offset > 0 {
+                    self.local = None;
+                }
+                self.tail = Some(tail);
             }
             self.tail.as_mut().unwrap().update(since, &mut self.local)
         })();
@@ -158,9 +189,30 @@ impl FocusLog {
             }
             self.local = None;
         }
-        let local = self.local.unwrap_or(false);
+        if let (Some(core), Some(tail), Some(local)) = (&self.core, &self.tail, self.local) {
+            let changed = self.checkpoint.as_ref().is_none_or(|c| {
+                c.core != *core
+                    || c.identity != tail.identity
+                    || c.local != local
+                    || tail.offset < c.offset
+            });
+            if changed && tail.offset > 0 && tail.pending.is_empty() {
+                if let Ok(checkpoint) = Checkpoint::new(core.clone(), tail, local) {
+                    if let Err(error) = checkpoint.save(&self.checkpoint_path) {
+                        log::warn!("Synergy focus checkpoint unavailable: {error}");
+                    }
+                    // Retry failures on the next focus change or rotation, not every poll.
+                    self.checkpoint = Some(checkpoint);
+                }
+            }
+        }
+        let caught_up = self
+            .tail
+            .as_ref()
+            .is_none_or(|tail| tail.file.metadata().is_ok_and(|m| tail.offset >= m.len()));
+        let local = self.local.filter(|_| caught_up).unwrap_or(false);
         if self.reported != Some(local) {
-            if self.local.is_none() {
+            if self.local.is_none() || !caught_up {
                 log::warn!(
                     "Synergy focus unknown: pausing shortcuts until startup or a screen entry/exit is logged"
                 );
@@ -177,6 +229,80 @@ impl FocusLog {
             self.reported = Some(local);
         }
         local
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Checkpoint {
+    core: (PathBuf, String),
+    identity: (u64, u64),
+    offset: u64,
+    anchor: Vec<u8>,
+    local: bool,
+}
+
+impl Checkpoint {
+    fn new(core: (PathBuf, String), tail: &Tail, local: bool) -> std::io::Result<Self> {
+        let mut anchor = vec![0; tail.offset.min(128) as usize];
+        let start = tail.offset - anchor.len() as u64;
+        tail.file.read_exact_at(&mut anchor, start)?;
+        Ok(Self {
+            core,
+            identity: tail.identity,
+            offset: tail.offset,
+            anchor,
+            local,
+        })
+    }
+
+    fn restore(
+        path: &std::path::Path,
+        log: &std::path::Path,
+        core: &Option<(PathBuf, String)>,
+    ) -> Option<(Self, Tail)> {
+        let saved: Self = serde_json::from_reader(File::open(path).ok()?.take(4096)).ok()?;
+        if Some(&saved.core) != core.as_ref()
+            || saved.offset == 0
+            || saved.anchor.len() != saved.offset.min(128) as usize
+        {
+            return None;
+        }
+        for path in [log.to_path_buf(), log.with_extension("jsonl.1")] {
+            let Ok(file) = File::open(path) else { continue };
+            let Ok(meta) = file.metadata() else { continue };
+            if (meta.dev(), meta.ino()) != saved.identity || meta.len() < saved.offset {
+                continue;
+            }
+            let mut anchor = vec![0; saved.anchor.len()];
+            let start = saved.offset - anchor.len() as u64;
+            if file.read_exact_at(&mut anchor, start).is_err() || anchor != saved.anchor {
+                continue;
+            }
+            let mut tail = Tail::new(file).ok()?;
+            tail.file.seek(SeekFrom::Start(saved.offset)).ok()?;
+            tail.offset = saved.offset;
+            return Some((saved, tail));
+        }
+        None
+    }
+
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let temp = path.with_extension(format!("{}.{nonce}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec(self)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        let result = std::io::Write::write_all(&mut file, &bytes)
+            .and_then(|()| std::fs::rename(&temp, path));
+        let _ = std::fs::remove_file(temp);
+        result
     }
 }
 
@@ -345,12 +471,129 @@ mod tests {
     }
 
     #[test]
+    fn restart_recovers_focus_after_records_rotate_away() {
+        let dir =
+            std::env::temp_dir().join(format!("wispr-synergy-restart-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("synergy.jsonl");
+        let previous = dir.join("synergy.jsonl.1");
+        let core = (dir.clone(), "2026-11-05T17:00:00".into());
+        let reader = || {
+            let mut focus = FocusLog::new(path.clone(), dir.join("focus.json"));
+            focus.core = Some(core.clone());
+            focus.next_scan = std::time::Instant::now() + Duration::from_secs(3600);
+            focus
+        };
+        std::fs::write(&path, record("entering screen")).unwrap();
+        let mut original = reader();
+        assert!(original.local());
+        // The live helper observes rotations, but neither log retains a focus event.
+        for _ in 0..2 {
+            std::fs::rename(&path, &previous).unwrap();
+            std::fs::write(&path, record("unrelated log activity")).unwrap();
+            assert!(original.local());
+        }
+        drop(original);
+        let mut restarted = reader();
+        assert!(
+            restarted.local(),
+            "helper restart must retain known local focus"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("focus.json")).unwrap().mode() & 0o777,
+            0o600
+        );
+        // Replay an unseen screen exit rather than trusting the saved local state.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(record("leaving screen").as_bytes())
+            .unwrap();
+        drop(restarted);
+        let mut remote = reader();
+        assert!(
+            !remote.local(),
+            "screen exits while the helper is stopped must be replayed"
+        );
+        drop(remote);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(record("entering screen").as_bytes())
+            .unwrap();
+        // Startup can find its checkpoint cursor in the previous rotated log.
+        std::fs::rename(&path, &previous).unwrap();
+        std::fs::write(&path, record("unrelated log activity")).unwrap();
+        let mut resumed = reader();
+        assert!(
+            resumed.local(),
+            "replay the old inode before reading its replacement"
+        );
+        drop(resumed);
+        std::fs::remove_file(&previous).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(record("leaving screen").as_bytes()).unwrap();
+        let mut catching_up = reader();
+        assert!(
+            !catching_up.local(),
+            "never forward keys before unseen records are replayed"
+        );
+        assert!(
+            !catching_up.local(),
+            "the late screen exit must leave capture paused"
+        );
+        let mut other_core = reader();
+        other_core.core.as_mut().unwrap().1 = "2026-11-05T19:00:00".into();
+        assert!(
+            !other_core.local(),
+            "never reuse another core lifetime's focus"
+        );
+        // The same inode and length cannot prove continuity after a rewrite.
+        std::fs::write(&path, record("rewritten unrelated activity").repeat(3)).unwrap();
+        assert!(
+            !reader().local(),
+            "a mismatched log anchor invalidates the checkpoint"
+        );
+        std::fs::write(dir.join("focus.json"), "invalid JSON").unwrap();
+        assert!(!reader().local(), "a malformed checkpoint must fail closed");
+        std::fs::write(&path, "").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        Checkpoint {
+            core: core.clone(),
+            identity: (meta.dev(), meta.ino()),
+            offset: 0,
+            anchor: vec![],
+            local: true,
+        }
+        .save(&dir.join("focus.json"))
+        .unwrap();
+        assert!(
+            !reader().local(),
+            "an empty log cannot prove cached focus continuity"
+        );
+        // An unwritable checkpoint must not disable capture when live focus is known.
+        std::fs::write(&path, record("entering screen")).unwrap();
+        std::fs::write(dir.join("blocked"), "not a directory").unwrap();
+        let mut blocked = reader();
+        blocked.checkpoint_path = dir.join("blocked/cache.json");
+        assert!(blocked.local());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn focus_log_retains_focus_during_rotation_gap() {
         let dir = std::env::temp_dir().join(format!("wispr-synergy-gap-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("synergy.jsonl");
         let previous = dir.join("synergy.jsonl.1");
-        let mut focus = FocusLog::new(path.clone());
+        let mut focus = FocusLog::new(path.clone(), dir.join("focus.json"));
         focus.core = Some((dir.clone(), "2026-11-05T17:00:00".into()));
         focus.next_scan = std::time::Instant::now() + Duration::from_secs(3600);
         assert!(
@@ -374,6 +617,7 @@ mod tests {
         assert!(focus.local());
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&previous).unwrap();
+        std::fs::remove_file(dir.join("focus.json")).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 
@@ -385,7 +629,7 @@ mod tests {
         let previous = dir.join("synergy.jsonl.1");
         std::fs::write(&previous, record("starting core")).unwrap();
         std::fs::write(&path, "").unwrap();
-        let mut focus = FocusLog::new(path.clone());
+        let mut focus = FocusLog::new(path.clone(), dir.join("focus.json"));
         focus.core = Some((dir.clone(), "2026-11-05T17:00:00".into()));
         focus.next_scan = std::time::Instant::now() + Duration::from_secs(3600);
         assert!(
@@ -426,6 +670,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(!focus.local(), "unreadable focus pauses shortcuts");
         std::fs::remove_file(&previous).unwrap();
+        std::fs::remove_file(dir.join("focus.json")).unwrap();
         std::fs::remove_dir(&dir).unwrap();
         assert!(focus.local(), "core exit restores ordinary shortcuts");
     }
@@ -444,7 +689,10 @@ mod tests {
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/state")
             });
-        let mut focus = FocusLog::new(state_home.join("Synergy/synergy.jsonl"));
+        let mut focus = FocusLog::new(
+            state_home.join("Synergy/synergy.jsonl"),
+            state_home.join("wispr-flow/synergy-focus.json"),
+        );
         assert!(find_core().is_some(), "Synergy must be running");
         let (raw_tx, raw_rx) = mpsc::channel();
         let (gated_tx, gated_rx) = mpsc::channel();
