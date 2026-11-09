@@ -129,7 +129,17 @@ impl FocusLog {
         // shortcut: Synergy 3 INFO JSONL logs are the focus interface; replace
         // this adapter when Synergy exposes active-screen state over IPC.
         let result = (|| -> std::io::Result<()> {
-            let file = File::open(&self.path)?;
+            let file = match File::open(&self.path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Rotation renames the log before creating its replacement.
+                    return match &mut self.tail {
+                        Some(tail) => tail.update(since, &mut self.local),
+                        None => Err(e),
+                    };
+                }
+                Err(e) => return Err(e),
+            };
             let metadata = file.metadata()?;
             let identity = (metadata.dev(), metadata.ino());
             if self.tail.as_ref().is_none_or(|t| t.identity != identity) {
@@ -332,6 +342,39 @@ mod tests {
         );
         assert_eq!(focus_record(&record("not leaving screen"), ""), None);
         assert_eq!(focus_record("incomplete JSON", ""), None);
+    }
+
+    #[test]
+    fn focus_log_retains_focus_during_rotation_gap() {
+        let dir = std::env::temp_dir().join(format!("wispr-synergy-gap-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("synergy.jsonl");
+        let previous = dir.join("synergy.jsonl.1");
+        let mut focus = FocusLog::new(path.clone());
+        focus.core = Some((dir.clone(), "2026-11-05T17:00:00".into()));
+        focus.next_scan = std::time::Instant::now() + Duration::from_secs(3600);
+        assert!(
+            !focus.local(),
+            "missing log at startup must pause shortcuts"
+        );
+        std::fs::write(&path, record("entering screen")).unwrap();
+        assert!(focus.local());
+
+        std::fs::rename(&path, &previous).unwrap();
+        assert!(focus.local(), "rotation gap must retain known local focus");
+        let mut old = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&previous)
+            .unwrap();
+        old.write_all(record("leaving screen").as_bytes()).unwrap();
+        assert!(!focus.local(), "read the old inode during the rotation gap");
+        std::fs::write(&path, "").unwrap();
+        assert!(!focus.local(), "empty replacement retains remote focus");
+        std::fs::write(&path, record("entering screen")).unwrap();
+        assert!(focus.local());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&previous).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
