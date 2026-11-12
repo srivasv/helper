@@ -12,7 +12,7 @@ use super::{EventSink, Selection};
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub fn start(tx: EventSink, uuid: String) {
-    start_with_reader(tx, uuid, read);
+    start_with_reader(tx, uuid, || read(None));
 }
 
 fn start_with_reader(
@@ -40,9 +40,9 @@ fn start_with_reader(
     });
 }
 
-pub fn query(tx: EventSink, uuid: String) {
+pub fn query(tx: EventSink, uuid: String, window_title: String) {
     std::thread::spawn(move || {
-        let payload = payload(read());
+        let payload = payload(read(Some(&window_title)));
         if tx
             .send(crate::proto::response("TextBoxInfo", payload, &uuid))
             .is_err()
@@ -69,7 +69,7 @@ fn payload(result: Result<Selection, String>) -> Value {
     }})
 }
 
-fn read() -> Result<Selection, String> {
+fn read(window_title: Option<&str>) -> Result<Selection, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -81,20 +81,48 @@ fn read() -> Result<Selection, String> {
                 .await
                 .map_err(|e| e.to_string())?;
             let conn = a11y.connection();
-            let field = super::atspi_edit::find_focused_field(conn)
-                .await?
-                .ok_or("no focused editor")?;
-            require_active_window(conn, &field).await?;
-            let context = super::atspi_text::context(conn, &field).await?;
-            if super::atspi_edit::find_focused_field(conn).await?.as_ref() != Some(&field) {
-                return Err("focused editor changed".into());
-            }
-            require_active_window(conn, &field).await?;
-            Ok(context)
+            read_on_connection(conn, window_title).await
         })
         .await
         .map_err(|_| "textbox context timed out".to_string())?
     })
+}
+
+pub(super) async fn read_on_connection(
+    conn: &zbus::Connection,
+    window_title: Option<&str>,
+) -> Result<Selection, String> {
+    let title = window_title.filter(|title| !title.is_empty());
+    let field = super::atspi_edit::find_focused_field(conn, title)
+        .await?
+        .ok_or("no focused editor")?;
+    // Native focus is authoritative; Electron can retain stale AT-SPI Active flags.
+    if title.is_none() {
+        require_active_window(conn, &field).await?;
+    }
+    let context = match super::atspi_text::context(conn, &field).await {
+        Ok(context) => context,
+        Err(_) if window_title.is_some() => {
+            // Transform queries need the whole highlight, beyond dictation's cap.
+            let snapshot = super::atspi_text::read_selected(conn, &field).await?;
+            Selection {
+                selected_text: snapshot.chars.into_iter().collect(),
+                ..Selection::default()
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if super::atspi_edit::find_focused_field(conn, title)
+        .await?
+        .as_ref()
+        != Some(&field)
+    {
+        return Err("focused editor changed".into());
+    }
+    if title.is_none() {
+        require_active_window(conn, &field).await?;
+    }
+    Ok(context)
 }
 
 async fn require_active_window(conn: &zbus::Connection, field: &ObjectRef) -> Result<(), String> {

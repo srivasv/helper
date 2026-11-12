@@ -70,7 +70,7 @@ pub trait Backend: Send {
     fn get_running_apps(&mut self) -> Result<Vec<RunningApp>>;
 
     /// `GetSelectedTextViaCopy`: copy-based selection probe (save clipboard, Ctrl+C, read, restore).
-    fn get_selected_text(&mut self) -> Result<Selection>;
+    fn get_selected_text(&mut self, window_title: &str) -> Result<Selection>;
 
     /// `GetAccessibilityStatus`: whether the accessibility/automation path is usable.
     fn accessibility_status(&mut self) -> bool;
@@ -220,8 +220,8 @@ impl Backend for Composed {
             .unwrap_or_default())
     }
 
-    fn get_selected_text(&mut self) -> Result<Selection> {
-        self.inner.get_selected_text()
+    fn get_selected_text(&mut self, window_title: &str) -> Result<Selection> {
+        self.inner.get_selected_text(window_title)
     }
 
     fn accessibility_status(&mut self) -> bool {
@@ -388,7 +388,7 @@ mod tests {
         fn simulate_key_press(&mut self, _: u32, _: &[String]) -> Result<()> {
             Ok(())
         }
-        fn get_selected_text(&mut self) -> Result<Selection> {
+        fn get_selected_text(&mut self, _window_title: &str) -> Result<Selection> {
             Ok(Selection::default())
         }
         fn accessibility_status(&mut self) -> bool {

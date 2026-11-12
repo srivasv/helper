@@ -119,7 +119,7 @@ async fn run(
         Some(f) => f,
         None => tokio::time::timeout(WALK_TIMEOUT, async {
             loop {
-                if let Some(field) = find_focused_field(conn).await? {
+                if let Some(field) = find_focused_field(conn, None).await? {
                     break Ok::<_, String>(field);
                 }
                 // Toolkits register asynchronously when the a11y registry starts.
@@ -256,6 +256,7 @@ fn edited_span(current: &[char], before: &[char], after: &[char]) -> Option<Stri
 /// depth/node budget — affordable because it runs off the paste path.
 pub(super) async fn find_focused_field(
     conn: &zbus::Connection,
+    window_title: Option<&str>,
 ) -> Result<Option<atspi::ObjectRef>, String> {
     let root = desktop_root(conn).await?;
     let mut windows = Vec::new();
@@ -269,6 +270,11 @@ pub(super) async fn find_focused_field(
             let Ok(win_proxy) = win.as_accessible_proxy(conn).await else {
                 continue;
             };
+            if let Some(title) = window_title {
+                if win_proxy.name().await.ok().as_deref() != Some(title) {
+                    continue;
+                }
+            }
             let active = win_proxy
                 .get_state()
                 .await
@@ -277,6 +283,9 @@ pub(super) async fn find_focused_field(
             let _ = win_proxy.get_attributes().await;
             windows.push((active, win));
         }
+    }
+    if window_title.is_some() && windows.len() != 1 {
+        return Ok(None);
     }
     search_window_groups(conn, windows, WALK_NODES).await
 }

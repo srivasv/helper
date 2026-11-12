@@ -20,7 +20,7 @@ impl Backend for StubBackend {
     fn get_running_apps(&mut self) -> Result<Vec<RunningApp>> {
         Ok(Vec::new())
     }
-    fn get_selected_text(&mut self) -> Result<Selection> {
+    fn get_selected_text(&mut self, _window_title: &str) -> Result<Selection> {
         Ok(Selection::default())
     }
     fn accessibility_status(&mut self) -> bool {

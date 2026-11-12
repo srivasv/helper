@@ -370,11 +370,11 @@ impl Backend for X11Backend {
         Ok(apps)
     }
 
-    fn get_selected_text(&mut self) -> Result<Selection> {
+    fn get_selected_text(&mut self, window_title: &str) -> Result<Selection> {
         // Prefer the non-destructive AT-SPI2 Text-interface read (no synthetic
         // copy, no clipboard churn). Fall back to the copy-probe below when the
         // a11y bus is unreachable or the focused object exposes no selection.
-        match super::atspi_sel::get_selection() {
+        match super::atspi_sel::get_selection((!window_title.is_empty()).then_some(window_title)) {
             Ok(Some(sel)) => return Ok(sel),
             Ok(None) => log::debug!("AT-SPI: no selection, falling back to copy-probe"),
             Err(e) => log::debug!("AT-SPI unavailable ({e}); falling back to copy-probe"),
