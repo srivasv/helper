@@ -47,7 +47,7 @@ const MAX_NODES: usize = 400;
 /// `Ok(None)` means "bus reachable, nothing selected" (fall back to copy-probe);
 /// `Err` means the accessibility bus is unavailable (also a fallback trigger,
 /// but worth logging distinctly).
-pub fn get_selection() -> Result<Option<Selection>, String> {
+pub fn get_selection(window_title: Option<&str>) -> Result<Option<Selection>, String> {
     // A current-thread runtime is enough: all the work is D-Bus round-trips, no
     // CPU-bound parallelism. Created per call so we hold no runtime between
     // requests (selection reads are infrequent and latency-tolerant).
@@ -57,7 +57,7 @@ pub fn get_selection() -> Result<Option<Selection>, String> {
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
     rt.block_on(async {
-        match tokio::time::timeout(PROBE_TIMEOUT, probe()).await {
+        match tokio::time::timeout(PROBE_TIMEOUT, probe(window_title)).await {
             Ok(res) => res,
             Err(_) => Err("AT-SPI probe timed out".to_string()),
         }
@@ -76,7 +76,7 @@ pub fn focused_is_terminal() -> bool {
         tokio::time::timeout(Duration::from_millis(800), async {
             let a11y = AccessibilityConnection::new().await.ok()?;
             let conn = a11y.connection();
-            let field = find_focused(conn).await.ok()??;
+            let field = find_focused(conn, None).await.ok()??;
             Some(is_terminal_widget(conn, &field).await)
         })
         .await
@@ -128,7 +128,7 @@ async fn is_terminal_widget(conn: &Connection, field: &ObjectRef) -> bool {
     false
 }
 
-async fn probe() -> Result<Option<Selection>, String> {
+async fn probe(window_title: Option<&str>) -> Result<Option<Selection>, String> {
     // Announce ourselves as an assistive-tech client so toolkits (Qt, GTK) expose
     // their accessible tree + Text interfaces. Without this the focused object's
     // selection is often silently empty on a stock session — and on KDE the
@@ -143,23 +143,29 @@ async fn probe() -> Result<Option<Selection>, String> {
         .map_err(|e| format!("a11y bus connect: {e}"))?;
     let conn = a11y.connection();
 
-    selection_on_connection(conn).await
+    selection_on_connection(conn, window_title).await
 }
 
-async fn selection_on_connection(conn: &Connection) -> Result<Option<Selection>, String> {
+async fn selection_on_connection(
+    conn: &Connection,
+    window_title: Option<&str>,
+) -> Result<Option<Selection>, String> {
     // Reserve time for read-only pages when a focus walk stalls elsewhere.
     if let Ok(Ok(Some(focused))) =
-        tokio::time::timeout(Duration::from_millis(800), find_focused(conn)).await
+        tokio::time::timeout(Duration::from_millis(800), find_focused(conn, window_title)).await
     {
         if let Some(selection) = read_selection(conn, &focused).await? {
             return Ok(Some(selection));
         }
     }
     // Browser page selections need not focus an editable (or any Text) widget.
-    web_selection(conn).await
+    web_selection(conn, window_title).await
 }
 
-async fn web_selection(conn: &Connection) -> Result<Option<Selection>, String> {
+async fn web_selection(
+    conn: &Connection,
+    window_title: Option<&str>,
+) -> Result<Option<Selection>, String> {
     let root = desktop_root(conn).await?;
     for app in root.get_children().await.unwrap_or_default() {
         let Ok(app) = app.as_accessible_proxy(conn).await else {
@@ -177,6 +183,11 @@ async fn web_selection(conn: &Connection) -> Result<Option<Selection>, String> {
             let Ok(proxy) = window.as_accessible_proxy(conn).await else {
                 continue;
             };
+            if let Some(title) = window_title {
+                if proxy.name().await.ok().as_deref() != Some(title) {
+                    continue;
+                }
+            }
             if !proxy
                 .get_state()
                 .await
@@ -295,7 +306,36 @@ pub(super) async fn desktop_root(conn: &Connection) -> Result<AccessibleProxy<'s
 /// are the desktop's direct children; we descend each looking for the node whose
 /// state set contains `Focused`. Bounded by depth/node count so a misbehaving
 /// provider can't make us walk forever.
-async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
+async fn find_focused(
+    conn: &Connection,
+    window_title: Option<&str>,
+) -> Result<Option<ObjectRef>, String> {
+    if let Some(title) = window_title {
+        if let Some(field) = super::atspi_edit::find_focused_field(conn, Some(title)).await? {
+            return Ok(Some(field));
+        }
+        // Preserve focused read-only widgets inside the native window too.
+        let root = desktop_root(conn).await?;
+        let mut matches = Vec::new();
+        for app in root.get_children().await.unwrap_or_default() {
+            let Ok(app) = app.as_accessible_proxy(conn).await else {
+                continue;
+            };
+            for window in app.get_children().await.unwrap_or_default() {
+                let Ok(proxy) = window.as_accessible_proxy(conn).await else {
+                    continue;
+                };
+                if proxy.name().await.ok().as_deref() == Some(title) {
+                    matches.push(window);
+                }
+            }
+        }
+        let [window] = matches.as_slice() else {
+            return Ok(None);
+        };
+        let mut budget = MAX_NODES;
+        return Ok(descend_for_focus(conn, window, 0, MAX_DEPTH, &mut budget).await);
+    }
     let tracked = super::atspi_focus::LAST_FOCUSED_WIDGET
         .lock()
         .ok()
@@ -312,7 +352,7 @@ async fn find_focused(conn: &Connection) -> Result<Option<ObjectRef>, String> {
         }
     }
     // Chromium editors are deeply nested and inactive windows retain Focused.
-    if let Some(field) = super::atspi_edit::find_focused_field(conn).await? {
+    if let Some(field) = super::atspi_edit::find_focused_field(conn, None).await? {
         return Ok(Some(field));
     }
     // Keep support for focused read-only widgets without Editable state.
@@ -452,6 +492,7 @@ mod tests {
     use super::*;
 
     struct Node {
+        name: String,
         focused: bool,
         active: bool,
         document: bool,
@@ -464,7 +505,7 @@ mod tests {
     impl Node {
         #[zbus(property)]
         fn name(&self) -> &str {
-            "Vivaldi"
+            &self.name
         }
         fn get_state(&self) -> atspi::StateSet {
             let mut states = atspi::StateSet::empty();
@@ -497,7 +538,7 @@ mod tests {
         }
     }
 
-    struct SelectedText(&'static str);
+    struct SelectedText(String);
     #[zbus::interface(name = "org.a11y.atspi.Text")]
     impl SelectedText {
         fn get_n_selections(&self) -> i32 {
@@ -517,6 +558,125 @@ mod tests {
         fn character_count(&self) -> i32 {
             self.0.chars().count() as i32
         }
+        #[zbus(property)]
+        fn caret_offset(&self) -> i32 {
+            self.0.chars().count() as i32
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a private dbus-run-session"]
+    fn transform_selection_uses_native_window_and_preserves_long_highlight() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = zbus::Connection::session().await.unwrap();
+                server
+                    .request_name("org.a11y.atspi.Registry")
+                    .await
+                    .unwrap();
+                let client = zbus::Connection::session().await.unwrap();
+                let object = |path: &str| ObjectRef {
+                    name: server.unique_name().unwrap().clone(),
+                    path: path.try_into().unwrap(),
+                };
+                let root = object("/org/a11y/atspi/accessible/root");
+                let stale = object("/stale");
+                let code = object("/code");
+                let stale_field = object("/stale/field");
+                let code_field = object("/code/field");
+                for (obj, parent, children, name, focused, active) in [
+                    (
+                        root.clone(),
+                        root.clone(),
+                        vec![stale.clone(), code.clone()],
+                        "desktop",
+                        false,
+                        false,
+                    ),
+                    (
+                        stale.clone(),
+                        root.clone(),
+                        vec![stale_field.clone()],
+                        "Slack",
+                        false,
+                        false,
+                    ),
+                    (
+                        code.clone(),
+                        root.clone(),
+                        vec![code_field.clone()],
+                        "Code",
+                        false,
+                        false,
+                    ),
+                    (
+                        stale_field.clone(),
+                        stale.clone(),
+                        vec![],
+                        "Slack window",
+                        true,
+                        true,
+                    ),
+                    (
+                        code_field.clone(),
+                        code.clone(),
+                        vec![],
+                        "Claude input - Visual Studio Code",
+                        true,
+                        false,
+                    ),
+                ] {
+                    server
+                        .object_server()
+                        .at(
+                            obj.path,
+                            Node {
+                                name: name.into(),
+                                parent,
+                                children,
+                                focused,
+                                active,
+                                document: false,
+                                class: String::new(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                let selected = "selected 日本 🦀\n".repeat(350);
+                server
+                    .object_server()
+                    .at(stale_field.path, SelectedText("old unrelated text".into()))
+                    .await
+                    .unwrap();
+                server
+                    .object_server()
+                    .at(code_field.path, SelectedText(selected.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    selection_on_connection(&client, Some("Claude input - Visual Studio Code"))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .selected_text,
+                    selected
+                );
+                let context = super::super::atspi_context::read_on_connection(
+                    &client,
+                    Some("Claude input - Visual Studio Code"),
+                )
+                .await
+                .unwrap();
+                assert_eq!(context.selected_text, selected);
+                assert!(selection_on_connection(&client, Some("closed window"))
+                    .await
+                    .unwrap()
+                    .is_none());
+            });
     }
 
     struct WebDocument(Vec<DocumentRange>);
@@ -559,6 +719,7 @@ mod tests {
                         .at(
                             node.path.clone(),
                             Node {
+                                name: "Vivaldi".into(),
                                 focused: false,
                                 active: i == 1,
                                 document: i == 19,
@@ -575,6 +736,7 @@ mod tests {
                     .at(
                         "/org/a11y/atspi/accessible/root",
                         Node {
+                            name: "Vivaldi".into(),
                             focused: false,
                             active: false,
                             document: false,
@@ -589,7 +751,7 @@ mod tests {
                     .object_server()
                     .at(
                         nodes[20].path.clone(),
-                        SelectedText("before selected 日本 🦀 after"),
+                        SelectedText("before selected 日本 🦀 after".into()),
                     )
                     .await
                     .unwrap();
@@ -602,7 +764,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    selection_on_connection(&client)
+                    selection_on_connection(&client, None)
                         .await
                         .unwrap()
                         .unwrap()
@@ -633,7 +795,10 @@ mod tests {
                     .unwrap();
                 window.get_mut().await.active = false;
                 assert!(
-                    selection_on_connection(&client).await.unwrap().is_none(),
+                    selection_on_connection(&client, None)
+                        .await
+                        .unwrap()
+                        .is_none(),
                     "inactive browser selections must not become command context"
                 );
             });
@@ -657,7 +822,9 @@ mod tests {
             Ok("1")
         );
         let _ = env_logger::try_init();
-        let selected = get_selection().unwrap().expect("no selected text found");
+        let selected = get_selection(None)
+            .unwrap()
+            .expect("no selected text found");
         assert!(!selected.selected_text.is_empty());
         assert!(!selected.selected_text.contains('\u{fffc}'));
         eprintln!(
@@ -695,6 +862,7 @@ mod tests {
                         .at(
                             node.path.clone(),
                             Node {
+                                name: "Vivaldi".into(),
                                 class: String::new(),
                                 parent: nodes[i.saturating_sub(1)].clone(),
                                 focused: i == 42,
@@ -711,6 +879,7 @@ mod tests {
                     .at(
                         "/org/a11y/atspi/accessible/root",
                         Node {
+                            name: "Vivaldi".into(),
                             class: String::new(),
                             parent: nodes[0].clone(),
                             focused: false,
@@ -723,10 +892,13 @@ mod tests {
                     .unwrap();
                 server
                     .object_server()
-                    .at(nodes[42].path.clone(), SelectedText("selected"))
+                    .at(nodes[42].path.clone(), SelectedText("selected".into()))
                     .await
                     .unwrap();
-                let field = find_focused(&client).await.unwrap().expect("deep editor");
+                let field = find_focused(&client, None)
+                    .await
+                    .unwrap()
+                    .expect("deep editor");
                 assert_eq!(
                     read_selection(&client, &field)
                         .await
@@ -741,13 +913,13 @@ mod tests {
                     .await
                     .unwrap();
                 for embedded in ["\u{fffc}", "before \u{fffc} after"] {
-                    text.get_mut().await.0 = embedded;
+                    text.get_mut().await.0 = embedded.into();
                     assert!(
                         read_selection(&client, &field).await.unwrap().is_none(),
                         "embedded rich-text placeholders must trigger the copy fallback"
                     );
                 }
-                text.get_mut().await.0 = "selected";
+                text.get_mut().await.0 = "selected".into();
                 assert!(!is_terminal_widget(&client, &field).await);
                 for (class, expected) in [
                     ("xterm-helper-textarea", true),
@@ -787,7 +959,7 @@ mod tests {
                 );
                 window.get_mut().await.active = true;
                 assert_eq!(
-                    find_focused(&client).await.unwrap(),
+                    find_focused(&client, None).await.unwrap(),
                     Some(nodes[42].clone()),
                     "selected editor deeper than 12 levels must be reachable"
                 );

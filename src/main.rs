@@ -248,20 +248,24 @@ fn handle_request(
 
         // ---- selection / accessibility ----
         "GetTextBoxInfo" => {
-            backend::atspi_context::query(ipc.tx.clone(), uuid.to_string());
+            let app = be.get_active_app().unwrap_or_default();
+            backend::atspi_context::query(ipc.tx.clone(), uuid.to_string(), app.window_title);
         }
-        "GetSelectedTextViaCopy" => match be.get_selected_text() {
-            Ok(s) => ipc.send(&proto::response(
-                "SelectedTextViaCopy",
-                json!({ "payload": {
-                    "selectedText": s.selected_text,
-                    "beforeText": s.before_text,
-                    "afterText": s.after_text,
-                    "contents": s.contents,
-                } }),
-                uuid,
-            )),
-            Err(e) => ipc.send(&proto::error(&format!("GetSelectedTextViaCopy failed: {e}"), uuid)),
+        "GetSelectedTextViaCopy" => {
+            let app = be.get_active_app().unwrap_or_default();
+            match be.get_selected_text(&app.window_title) {
+                Ok(s) => ipc.send(&proto::response(
+                    "SelectedTextViaCopy",
+                    json!({ "payload": {
+                        "selectedText": s.selected_text,
+                        "beforeText": s.before_text,
+                        "afterText": s.after_text,
+                        "contents": s.contents,
+                    } }),
+                    uuid,
+                )),
+                Err(e) => ipc.send(&proto::error(&format!("GetSelectedTextViaCopy failed: {e}"), uuid)),
+            }
         },
         "GetAccessibilityStatus" => {
             let status = be.accessibility_status();
@@ -358,6 +362,7 @@ mod tests {
         fn get_active_app(&mut self) -> backend::Result<backend::ActiveApp> {
             Ok(backend::ActiveApp {
                 app_name: "konsole".into(),
+                window_title: "Native test window".into(),
                 ..Default::default()
             })
         }
@@ -367,8 +372,11 @@ mod tests {
         fn get_running_apps(&mut self) -> backend::Result<Vec<backend::RunningApp>> {
             unreachable!()
         }
-        fn get_selected_text(&mut self) -> backend::Result<backend::Selection> {
-            unreachable!()
+        fn get_selected_text(&mut self, window_title: &str) -> backend::Result<backend::Selection> {
+            Ok(backend::Selection {
+                selected_text: window_title.into(),
+                ..Default::default()
+            })
         }
         fn accessibility_status(&mut self) -> bool {
             false
@@ -381,6 +389,26 @@ mod tests {
         fn held_vks(&self) -> std::collections::HashSet<u32> {
             Default::default()
         }
+    }
+
+    #[test]
+    fn selection_query_passes_native_window_to_backend() {
+        let (tx, rx) = mpsc::channel();
+        let msg = Incoming::parse(
+            &json!({"HelperAPIRequest": {"uuid": "selection-query", "GetSelectedTextViaCopy": {"payload": {}}}}).to_string(),
+        ).unwrap();
+        handle_request(
+            &mut PasteBackend(false),
+            &PasteBackend(false),
+            &IpcWriter { tx },
+            &msg,
+            Instant::now(),
+        );
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            reply["HelperAPIResponse"]["SelectedTextViaCopy"]["payload"]["selectedText"],
+            "Native test window"
+        );
     }
 
     #[test]
