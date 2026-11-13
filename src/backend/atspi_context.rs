@@ -11,8 +11,8 @@ use super::{EventSink, Selection};
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-pub fn start(tx: EventSink, uuid: String) {
-    start_with_reader(tx, uuid, || read(None));
+pub fn start(tx: EventSink, uuid: String, window_title: String) {
+    start_with_reader(tx, uuid, move || read(Some(&window_title), false));
 }
 
 fn start_with_reader(
@@ -42,7 +42,7 @@ fn start_with_reader(
 
 pub fn query(tx: EventSink, uuid: String, window_title: String) {
     std::thread::spawn(move || {
-        let payload = payload(read(Some(&window_title)));
+        let payload = payload(read(Some(&window_title), true));
         if tx
             .send(crate::proto::response("TextBoxInfo", payload, &uuid))
             .is_err()
@@ -69,7 +69,7 @@ fn payload(result: Result<Selection, String>) -> Value {
     }})
 }
 
-fn read(window_title: Option<&str>) -> Result<Selection, String> {
+fn read(window_title: Option<&str>, selection_fallback: bool) -> Result<Selection, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -81,7 +81,7 @@ fn read(window_title: Option<&str>) -> Result<Selection, String> {
                 .await
                 .map_err(|e| e.to_string())?;
             let conn = a11y.connection();
-            read_on_connection(conn, window_title).await
+            read_on_connection(conn, window_title, selection_fallback).await
         })
         .await
         .map_err(|_| "textbox context timed out".to_string())?
@@ -91,6 +91,7 @@ fn read(window_title: Option<&str>) -> Result<Selection, String> {
 pub(super) async fn read_on_connection(
     conn: &zbus::Connection,
     window_title: Option<&str>,
+    selection_fallback: bool,
 ) -> Result<Selection, String> {
     let title = window_title.filter(|title| !title.is_empty());
     let field = super::atspi_edit::find_focused_field(conn, title)
@@ -102,7 +103,7 @@ pub(super) async fn read_on_connection(
     }
     let context = match super::atspi_text::context(conn, &field).await {
         Ok(context) => context,
-        Err(_) if window_title.is_some() => {
+        Err(_) if selection_fallback => {
             // Transform queries need the whole highlight, beyond dictation's cap.
             let snapshot = super::atspi_text::read_selected(conn, &field).await?;
             Selection {
@@ -152,6 +153,30 @@ async fn require_active_window(conn: &zbus::Connection, field: &ObjectRef) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a live editor with the caret inside a sentence"]
+    fn live_mid_sentence_context() {
+        let title = std::env::var("WISPR_CONTEXT_TEST_WINDOW").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        start(tx, "live-context".into(), title);
+        let message = rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        let context = &message["HelperAPIRequest"]["TextBoxInfo"]["payload"];
+        assert_eq!(context["couldNotGetTextBoxInfo"], false);
+        let before = context["beforeText"].as_str().unwrap();
+        let selected = context["selectedText"].as_str().unwrap();
+        let after = context["afterText"].as_str().unwrap();
+        eprintln!(
+            "context lengths: before={} selected={} after={}",
+            before.chars().count(),
+            selected.chars().count(),
+            after.chars().count(),
+        );
+        assert!(!before.is_empty(), "missing preceding sentence");
+        assert!(!after.is_empty(), "missing following sentence");
+        assert!(selected.is_empty(), "expected an insertion caret");
+        crate::proto::encode(&message).expect("context must fit the IPC frame");
+    }
 
     struct WindowFixture {
         active: bool,

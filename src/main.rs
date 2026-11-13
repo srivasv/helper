@@ -318,7 +318,8 @@ fn handle_request(
 
         // ---- lifecycle ----
         "DictationStart" => {
-            backend::atspi_context::start(ipc.tx.clone(), uuid.to_string());
+            let app = be.get_active_app().unwrap_or_default();
+            backend::atspi_context::start(ipc.tx.clone(), uuid.to_string(), app.window_title);
             ipc.send(&proto::ack(uuid));
         }
         // Electron resets the dictation's app at every start and refills it

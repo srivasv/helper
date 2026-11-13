@@ -250,6 +250,16 @@ fn edited_span(current: &[char], before: &[char], after: &[char]) -> Option<Stri
     (!edited.trim().is_empty()).then_some(edited)
 }
 
+// KWin captions omit the profile suffix exposed by Chrome accessibility.
+pub(super) fn window_title_matches(native: &str, accessible: &str) -> bool {
+    native == accessible
+        || (native.ends_with(" - Google Chrome")
+            && accessible
+                .strip_prefix(native)
+                .and_then(|suffix| suffix.strip_prefix(" - "))
+                .is_some_and(|profile| !profile.is_empty()))
+}
+
 /// Locate the focused field, preferring active windows without requiring that flag.
 /// Web content (Chromium/Electron) nests the field far deeper than the shared
 /// shallow walk used for selection reads reaches, so this one gets a larger
@@ -271,7 +281,12 @@ pub(super) async fn find_focused_field(
                 continue;
             };
             if let Some(title) = window_title {
-                if win_proxy.name().await.ok().as_deref() != Some(title) {
+                if !win_proxy
+                    .name()
+                    .await
+                    .ok()
+                    .is_some_and(|name| window_title_matches(title, &name))
+                {
                     continue;
                 }
             }
@@ -454,6 +469,22 @@ fn locate(hay: &[char], needle: &[char], caret: i32) -> Option<usize> {
 mod tests {
     use super::super::atspi_sel::descend_for_focus;
     use super::*;
+
+    #[test]
+    fn chrome_profile_suffix_preserves_native_window_matching() {
+        let title = "A document - Google Docs - Google Chrome";
+        assert!(window_title_matches(title, title));
+        assert!(window_title_matches(
+            title,
+            &format!("{title} - Srivas (Work)")
+        ));
+        assert!(!window_title_matches(
+            title,
+            "Another document - Google Chrome - Work"
+        ));
+        assert!(!window_title_matches(title, &format!("{title} - ")));
+        assert!(!window_title_matches("Editor", "Editor - another window"));
+    }
 
     fn c(s: &str) -> Vec<char> {
         s.chars().collect()

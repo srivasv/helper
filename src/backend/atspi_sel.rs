@@ -184,7 +184,12 @@ async fn web_selection(
                 continue;
             };
             if let Some(title) = window_title {
-                if proxy.name().await.ok().as_deref() != Some(title) {
+                if !proxy
+                    .name()
+                    .await
+                    .ok()
+                    .is_some_and(|name| super::atspi_edit::window_title_matches(title, &name))
+                {
                     continue;
                 }
             }
@@ -564,6 +569,30 @@ mod tests {
         }
     }
 
+    struct CursorText;
+
+    #[zbus::interface(name = "org.a11y.atspi.Text")]
+    impl CursorText {
+        fn get_n_selections(&self) -> i32 {
+            0
+        }
+        fn get_text(&self, start: i32, end: i32) -> String {
+            "We were discussing Linux already."
+                .chars()
+                .skip(start as usize)
+                .take((end - start) as usize)
+                .collect()
+        }
+        #[zbus(property)]
+        fn character_count(&self) -> i32 {
+            33
+        }
+        #[zbus(property)]
+        fn caret_offset(&self) -> i32 {
+            19
+        }
+    }
+
     #[test]
     #[ignore = "requires a private dbus-run-session"]
     fn transform_selection_uses_native_window_and_preserves_long_highlight() {
@@ -654,7 +683,7 @@ mod tests {
                     .unwrap();
                 server
                     .object_server()
-                    .at(code_field.path, SelectedText(selected.clone()))
+                    .at(code_field.path.clone(), SelectedText(selected.clone()))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -668,10 +697,71 @@ mod tests {
                 let context = super::super::atspi_context::read_on_connection(
                     &client,
                     Some("Claude input - Visual Studio Code"),
+                    true,
                 )
                 .await
                 .unwrap();
                 assert_eq!(context.selected_text, selected);
+                assert!(
+                    super::super::atspi_context::read_on_connection(
+                        &client,
+                        Some("Claude input - Visual Studio Code"),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                    "dictation must retain the 500-character selection cap"
+                );
+                server
+                    .object_server()
+                    .remove::<SelectedText, _>(code_field.path.clone())
+                    .await
+                    .unwrap();
+                server
+                    .object_server()
+                    .at(code_field.path, CursorText)
+                    .await
+                    .unwrap();
+                let context = super::super::atspi_context::read_on_connection(
+                    &client,
+                    Some("Claude input - Visual Studio Code"),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(context.before_text, "We were discussing ");
+                assert_eq!(context.after_text, "Linux already.");
+                assert!(context.selected_text.is_empty());
+                let chrome = server
+                    .object_server()
+                    .interface::<_, Node>("/code/field")
+                    .await
+                    .unwrap();
+                chrome.get_mut().await.name = "Document - Google Chrome - Work".into();
+                let context = super::super::atspi_context::read_on_connection(
+                    &client,
+                    Some("Document - Google Chrome"),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(context.before_text, "We were discussing ");
+                let other = server
+                    .object_server()
+                    .interface::<_, Node>("/stale/field")
+                    .await
+                    .unwrap();
+                other.get_mut().await.name = "Document - Google Chrome - Personal".into();
+                assert!(
+                    super::super::atspi_context::read_on_connection(
+                        &client,
+                        Some("Document - Google Chrome"),
+                        false,
+                    )
+                    .await
+                    .is_err(),
+                    "ambiguous Chrome profiles must not supply context"
+                );
                 assert!(selection_on_connection(&client, Some("closed window"))
                     .await
                     .unwrap()
