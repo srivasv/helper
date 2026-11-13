@@ -122,6 +122,7 @@ async fn snapshot(
         expanded: false,
         selected,
         map_caret,
+        caret_only: map_caret && docs_editor(conn, &parent).await,
     };
     let (chars, _, mapped_caret) = reader.node(root, None, 0).await?;
     let text = TextProxy::builder(conn)
@@ -152,6 +153,42 @@ async fn snapshot(
     })
 }
 
+async fn docs_editor(conn: &zbus::Connection, parent: &ObjectRef) -> bool {
+    let Ok(document) = parent.as_accessible_proxy(conn).await else {
+        return false;
+    };
+    let Ok(frame) = document.parent().await else {
+        return false;
+    };
+    let Ok(frame) = frame.as_accessible_proxy(conn).await else {
+        return false;
+    };
+    frame
+        .get_attributes()
+        .await
+        .ok()
+        .and_then(|attrs| attrs.get("class").cloned())
+        .is_some_and(|classes| {
+            classes
+                .split_whitespace()
+                .any(|class| class == "docs-texteventtarget-iframe")
+        })
+}
+
+fn context_block_role(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Heading
+            | Role::Table
+            | Role::TableRow
+            | Role::TableCell
+            | Role::ColumnHeader
+            | Role::RowHeader
+            | Role::List
+            | Role::ListItem
+    )
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -178,6 +215,7 @@ struct Reader<'a> {
     expanded: bool,
     selected: bool,
     map_caret: bool,
+    caret_only: bool,
 }
 
 impl Reader<'_> {
@@ -201,10 +239,12 @@ impl Reader<'_> {
                 if acc.parent().await.map_err(err)? != *parent {
                     return Err("embedded object is outside its parent".into());
                 }
-                if !matches!(
+                let text_role = matches!(
                     role,
                     Role::Paragraph | Role::Static | Role::Text | Role::Link | Role::Section
-                ) {
+                );
+                let context_block = self.caret_only && context_block_role(role);
+                if !text_role && !context_block {
                     return Err("unsupported embedded object".into());
                 }
                 let states = acc.get_state().await.map_err(err)?;
@@ -237,7 +277,7 @@ impl Reader<'_> {
             if raw_caret < -1 || raw_caret > n {
                 return Err("invalid caret offset".into());
             }
-            let range = if self.selected {
+            let mut range = if self.selected {
                 let count: i32 = text
                     .inner()
                     .call("GetNSelections", &())
@@ -257,6 +297,12 @@ impl Reader<'_> {
             let raw: Vec<char> = text.get_text(0, n).await.map_err(err)?.chars().collect();
             if raw.len() != n as usize {
                 return Err("text length changed during read".into());
+            }
+            // Docs exposes the whole document, including unrelated tables. Follow
+            // only the caret's embedded-object chain to its current text block.
+            if self.caret_only && raw_caret >= 0 && raw.get(raw_caret as usize) == Some(&'\u{fffc}')
+            {
+                range = raw_caret as usize..raw_caret as usize + 1;
             }
             self.chars_read += raw.len();
             let mut out = Vec::new();
@@ -313,7 +359,8 @@ impl Reader<'_> {
                 let child = proxy.get_object(0).await.map_err(err)?;
                 let (chars, child_role, child_caret) =
                     self.node(&child, Some(obj), depth + 1).await?;
-                let block = child_role == Role::Paragraph;
+                let block = child_role == Role::Paragraph
+                    || (self.caret_only && context_block_role(child_role));
                 if previous_block
                     && block
                     && out.last() != Some(&'\n')
@@ -397,6 +444,7 @@ mod tests {
     #[derive(Clone)]
     struct Node {
         role: Role,
+        classes: String,
         parent: ObjectRef,
         states: atspi::StateSet,
         text: String,
@@ -420,6 +468,12 @@ mod tests {
     struct Accessible(Shared);
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl Accessible {
+        fn get_attributes(&self) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::from([(
+                "class".into(),
+                self.0.lock().unwrap().classes.clone(),
+            )])
+        }
         fn get_role(&self) -> Role {
             self.0.lock().unwrap().role
         }
@@ -535,6 +589,7 @@ mod tests {
         };
         let node = Arc::new(Mutex::new(Node {
             role,
+            classes: String::new(),
             parent: parent.clone(),
             states: if role == Role::Entry {
                 {
@@ -579,6 +634,85 @@ mod tests {
             .await
             .unwrap();
         (obj, node)
+    }
+
+    #[test]
+    #[ignore = "requires a private dbus-run-session"]
+    fn docs_table_context_follows_only_the_caret() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = zbus::Connection::session().await.unwrap();
+                let client = zbus::Connection::session().await.unwrap();
+                let null = ObjectRef {
+                    name: server.unique_name().unwrap().clone(),
+                    path: "/null".try_into().unwrap(),
+                };
+                let (frame, frame_data) =
+                    fixture(&server, "/docs_frame", &null, Role::InternalFrame, "").await;
+                frame_data.lock().unwrap().classes =
+                    "docs-texteventtarget-iframe docs-offscreen-z-index".into();
+                let (document, _) =
+                    fixture(&server, "/docs_document", &frame, Role::DocumentWeb, "").await;
+                let (editor, editor_data) = fixture(
+                    &server,
+                    "/docs_editor",
+                    &document,
+                    Role::Entry,
+                    "\u{fffc}\u{fffc}",
+                )
+                .await;
+                let (unrelated, unrelated_data) = fixture(
+                    &server,
+                    "/unrelated_image",
+                    &editor,
+                    Role::Image,
+                    "unrelated",
+                )
+                .await;
+                editor_data.lock().unwrap().caret = Some(1);
+                editor_data.lock().unwrap().selection = None;
+                let mut parent = editor.clone();
+                let mut parent_data = editor_data.clone();
+                for (path, role) in [
+                    ("/table", Role::Table),
+                    ("/row", Role::TableRow),
+                    ("/cell", Role::TableCell),
+                    ("/paragraph", Role::Paragraph),
+                ] {
+                    let paragraph = role == Role::Paragraph;
+                    let (child, child_data) = fixture(
+                        &server,
+                        path,
+                        &parent,
+                        role,
+                        if paragraph {
+                            "We were discussing 日本 already."
+                        } else {
+                            "\u{fffc}"
+                        },
+                    )
+                    .await;
+                    child_data.lock().unwrap().caret = Some(if paragraph { 19 } else { 0 });
+                    if parent == editor {
+                        child_data.lock().unwrap().start = 1;
+                        parent_data.lock().unwrap().links = vec![unrelated.clone(), child.clone()];
+                    } else {
+                        parent_data.lock().unwrap().links = vec![child.clone()];
+                    }
+                    parent = child;
+                    parent_data = child_data;
+                }
+                let result = context(&client, &editor).await.unwrap();
+                assert_eq!(result.before_text, "We were discussing ");
+                assert_eq!(result.after_text, "日本 already.");
+                assert!(result.selected_text.is_empty());
+                assert_eq!(unrelated_data.lock().unwrap().reads, 0);
+                parent_data.lock().unwrap().role = Role::PasswordText;
+                assert!(context(&client, &editor).await.is_err());
+            });
     }
 
     async fn checks() {

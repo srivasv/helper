@@ -65,6 +65,10 @@ struct Shared {
 
 impl Shared {
     fn on_activation(&self, app: ActiveApp) {
+        // The recording pill takes focus briefly; it is never the paste target.
+        if app.bundle_id == "wispr-flow" && app.window_title == "Status" {
+            return;
+        }
         // KWin fires windowActivated(null) when focus lands on the desktop / no
         // window (e.g. transiently while one app closes and the next maps),
         // which parses to a fully-empty ActiveApp. Don't let that blank out the
@@ -478,4 +482,49 @@ wisprReport(workspace.activeWindow || workspace.activeClient);
 wisprReportList();
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_status_preserves_target_but_scratchpad_can_take_focus() {
+        let (tx, rx) = mpsc::channel();
+        let shared = Shared {
+            cache: Mutex::new(None),
+            apps: Mutex::new(Vec::new()),
+            events: tx,
+            focus_active: AtomicBool::new(true),
+            last_emitted: Mutex::new(None),
+            counter: AtomicU64::new(0),
+            pid: 1,
+        };
+        shared.on_activation(ActiveApp {
+            bundle_id: "google-chrome".into(),
+            window_title: "Document - Google Chrome".into(),
+            ..ActiveApp::default()
+        });
+        rx.recv().unwrap();
+        shared.on_activation(ActiveApp {
+            bundle_id: "wispr-flow".into(),
+            window_title: "Status".into(),
+            ..ActiveApp::default()
+        });
+        assert_eq!(
+            shared.cache.lock().unwrap().as_ref().unwrap().bundle_id,
+            "google-chrome"
+        );
+        assert!(rx.try_recv().is_err());
+        shared.on_activation(ActiveApp {
+            bundle_id: "wispr-flow".into(),
+            window_title: "Scratchpad".into(),
+            ..ActiveApp::default()
+        });
+        assert_eq!(
+            shared.cache.lock().unwrap().as_ref().unwrap().window_title,
+            "Scratchpad"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
 }
