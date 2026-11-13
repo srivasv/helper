@@ -10,7 +10,7 @@
 //!   2. Load a KWin script (via `org.kde.kwin.Scripting.loadScript`) that
 //!      connects `workspace.windowActivated` to a function pushing the active
 //!      window's `{resourceClass, resourceName, caption, pid}` to our service,
-//!      and fires once for the current `workspace.activeWindow`.
+//!      watches its caption changes, and fires once for the current window.
 //!   3. Cache the latest report; `get_active_app()` reads the cache, and — when
 //!      focus detection is enabled (`SetFocusChangeDetectorState`) — each change
 //!      is emitted on fd 3 as an `AppInfoUpdate` helper-initiated request.
@@ -88,6 +88,16 @@ impl Shared {
 
     /// Emit an `AppInfoUpdate` request on fd 3 unless it duplicates the last one.
     fn emit(&self, app: &ActiveApp) {
+        // Serialize publication with focus changes, including delayed re-announcements.
+        let Ok(cached) = self.cache.lock() else {
+            return;
+        };
+        let Some(current) = cached.as_ref() else {
+            return;
+        };
+        if current.bundle_id != app.bundle_id || current.window_title != app.window_title {
+            return;
+        }
         let key = format!("{}\u{1f}{}", app.bundle_id, app.window_title);
         if let Ok(mut last) = self.last_emitted.lock() {
             if last.as_deref() == Some(key.as_str()) {
@@ -464,8 +474,28 @@ function wisprReportList() {{
     }}
     callDBus("{service}", "{path}", "org.wisprflow.kwinbridge", "ReportList", JSON.stringify(out));
 }}
-workspace.windowActivated.connect(function(w) {{
+var wisprWatchedWindow = null;
+function wisprCaptionChanged() {{
+    var w = workspace.activeWindow || workspace.activeClient;
+    if (w && w === wisprWatchedWindow) {{ wisprReport(w); }}
+}}
+function wisprWatchActiveWindow(w) {{
+    if (wisprWatchedWindow !== w) {{
+        if (wisprWatchedWindow) {{
+            // The previous window may already have been destroyed.
+            try {{
+                wisprWatchedWindow.captionChanged.disconnect(wisprCaptionChanged);
+            }} catch (e) {{}}
+        }}
+        wisprWatchedWindow = w;
+        if (w && w.captionChanged) {{
+            w.captionChanged.connect(wisprCaptionChanged);
+        }}
+    }}
     wisprReport(w);
+}}
+workspace.windowActivated.connect(function(w) {{
+    wisprWatchActiveWindow(w);
     wisprReportList();
 }});
 if (typeof workspace.windowAdded !== "undefined") {{
@@ -478,7 +508,7 @@ if (typeof workspace.windowRemoved !== "undefined") {{
 }} else if (typeof workspace.clientRemoved !== "undefined") {{
     workspace.clientRemoved.connect(wisprReportList);
 }}
-wisprReport(workspace.activeWindow || workspace.activeClient);
+wisprWatchActiveWindow(workspace.activeWindow || workspace.activeClient);
 wisprReportList();
 "#
     )
@@ -487,6 +517,110 @@ wisprReportList();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Node.js to execute the KWin script fixture"]
+    fn active_tab_caption_updates_the_recording_target() {
+        let setup = r#"
+const assert = require('node:assert/strict');
+function signal() {
+    return {
+        listeners: [],
+        connect(fn) { this.listeners.push(fn); },
+        disconnect(fn) { this.listeners = this.listeners.filter(x => x !== fn); },
+        emit(...args) { for (const fn of [...this.listeners]) fn(...args); }
+    };
+}
+function window(className, caption) {
+    return { resourceClass: className, resourceName: className, caption,
+        pid: 1, normalWindow: true, skipTaskbar: false, captionChanged: signal() };
+}
+const chrome = window('google-chrome', 'Gmail - Google Chrome');
+const vivaldi = window('vivaldi-stable', 'Other browser');
+const workspace = { activeWindow: chrome, windowActivated: signal(),
+    windowAdded: signal(), windowRemoved: signal(), windowList: () => [chrome, vivaldi] };
+const reports = [];
+function callDBus(service, path, iface, member, payload) {
+    if (member === 'Report') reports.push(JSON.parse(payload));
+}
+"#;
+        let checks = r#"
+assert.equal(reports.at(-1).caption, 'Gmail - Google Chrome');
+chrome.caption = 'Document - Google Docs - Google Chrome';
+chrome.captionChanged.emit();
+assert.equal(reports.at(-1).caption, chrome.caption,
+    'changing tabs without changing windows left the Gmail target cached');
+workspace.activeWindow = vivaldi;
+workspace.windowActivated.emit(vivaldi);
+const count = reports.length;
+chrome.caption = 'Another inactive tab';
+chrome.captionChanged.emit();
+assert.equal(reports.length, count, 'inactive captions replaced the active browser');
+vivaldi.caption = 'Current Vivaldi tab';
+vivaldi.captionChanged.emit();
+assert.equal(reports.at(-1).caption, vivaldi.caption);
+workspace.activeWindow = chrome;
+workspace.windowActivated.emit(chrome);
+chrome.caption = 'Returned to Docs';
+chrome.captionChanged.emit();
+assert.equal(reports.at(-1).caption, chrome.caption);
+assert.equal(chrome.captionChanged.listeners.length, 1, 'duplicate caption subscription');
+workspace.activeWindow = null;
+workspace.windowActivated.emit(null);
+const afterBlur = reports.length;
+chrome.captionChanged.emit();
+assert.equal(reports.length, afterBlur, 'blur retained a caption subscription');
+"#;
+        let result = std::process::Command::new("node")
+            .arg("-e")
+            .arg(format!(
+                "{setup}\n{}\n{checks}",
+                kwin_script("fixture", "/active")
+            ))
+            .output()
+            .expect("Node.js is required for the KWin script regression");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn delayed_recording_announcement_cannot_replace_newer_focus() {
+        let (tx, rx) = mpsc::channel();
+        let old = ActiveApp {
+            bundle_id: "vivaldi-stable".into(),
+            window_title: "Old browser".into(),
+            ..ActiveApp::default()
+        };
+        let shared = Shared {
+            cache: Mutex::new(Some(old.clone())),
+            apps: Mutex::new(Vec::new()),
+            events: tx,
+            focus_active: AtomicBool::new(true),
+            last_emitted: Mutex::new(None),
+            counter: AtomicU64::new(0),
+            pid: 1,
+        };
+        // RecordingStarted can retain this snapshot while a D-Bus report runs.
+        let snapshot = shared.cache.lock().unwrap().clone().unwrap();
+        shared.on_activation(ActiveApp {
+            bundle_id: "google-chrome".into(),
+            window_title: "Document - Google Chrome".into(),
+            ..ActiveApp::default()
+        });
+        let current = rx.recv().unwrap();
+        assert_eq!(
+            current["HelperAPIRequest"]["AppInfoUpdate"]["payload"]["bundleId"],
+            "google-chrome"
+        );
+        shared.emit(&snapshot);
+        assert!(
+            rx.try_recv().is_err(),
+            "stale Vivaldi snapshot followed Chrome"
+        );
+    }
 
     #[test]
     fn recording_status_preserves_target_but_scratchpad_can_take_focus() {

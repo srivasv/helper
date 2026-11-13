@@ -31,7 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-gi gir1.2-atspi-2.0 gir1.2-gtk-3.0 at-spi2-core \
-            dbus-x11 xvfb xauth xdotool x11-utils xclip zenity kdialog
+            dbus-x11 xvfb xauth xdotool x11-utils xclip zenity kdialog nodejs
       - run: cargo build --locked
       - name: Test paste shortcuts and post-paste edits over real IPC
         run: /usr/bin/python3 parity_test.py target/debug/wispr-flow-linux-helper
@@ -45,6 +45,8 @@ jobs:
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test rich_text_boundaries -- --ignored
       - name: Test Google Docs table caret context
         run: dbus-run-session -- cargo test docs_table_context -- --ignored
+      - name: Test active browser tab title updates
+        run: cargo test active_tab_caption -- --ignored
       - name: Test dictation context active-window privacy
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test context_requires_an_active_window -- --ignored
       - name: Test Chromium rich-text edits with events and lazy accessibility

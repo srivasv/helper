@@ -55,7 +55,7 @@ pub fn query(tx: EventSink, uuid: String, window_title: String) {
 fn payload(result: Result<Selection, String>) -> Value {
     let available = result.is_ok();
     let text = result.unwrap_or_else(|error| {
-        log::debug!("textbox context unavailable: {error}");
+        log::info!("textbox context unavailable: {error}");
         Selection::default()
     });
     json!({"payload": {
