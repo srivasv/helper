@@ -22,6 +22,7 @@ pub(super) struct Snapshot {
     pub chars: Vec<char>,
     pub caret: i32,
     expanded: bool,
+    selection: Option<(i32, i32)>,
 }
 
 pub(super) async fn read(conn: &zbus::Connection, root: &ObjectRef) -> Result<Snapshot> {
@@ -47,10 +48,6 @@ async fn context_snapshot(
     conn: &zbus::Connection,
     root: &ObjectRef,
 ) -> Result<(Snapshot, i32, i32)> {
-    let snapshot = snapshot(conn, root, false, true).await?;
-    if snapshot.caret < 0 {
-        return Err("caret unavailable for editor".into());
-    }
     let text = TextProxy::builder(conn)
         .destination(root.name.as_str())
         .map_err(err)?
@@ -60,20 +57,33 @@ async fn context_snapshot(
         .build()
         .await
         .map_err(err)?;
+    let selection = text_selection(&text).await?;
+    let snapshot = snapshot(conn, root, false, true).await?;
+    if snapshot.caret < 0 {
+        return Err("caret unavailable for editor".into());
+    }
+    if text_selection(&text).await? != selection {
+        return Err("selection changed during read".into());
+    }
+    let (start, end) = match (snapshot.expanded, selection, snapshot.selection) {
+        (_, None, None) => (snapshot.caret, snapshot.caret),
+        (false, Some(range), _) | (true, Some(_), Some(range)) => range,
+        _ => return Err("selection offsets unavailable for expanded editor".into()),
+    };
+    Ok((snapshot, start, end))
+}
+
+async fn text_selection(text: &TextProxy<'_>) -> Result<Option<(i32, i32)>> {
     let count: i32 = text
         .inner()
         .call("GetNSelections", &())
         .await
         .map_err(err)?;
-    if snapshot.expanded && count != 0 {
-        return Err("selection offsets unavailable for expanded editor".into());
+    match count {
+        0 => Ok(None),
+        1 => text.get_selection(0).await.map(Some).map_err(err),
+        _ => Err("ambiguous editor selection".into()),
     }
-    let (start, end) = match count {
-        0 => (snapshot.caret, snapshot.caret),
-        1 => text.get_selection(0).await.map_err(err)?,
-        _ => return Err("ambiguous editor selection".into()),
-    };
-    Ok((snapshot, start, end))
 }
 
 fn split_context(chars: &[char], start: i32, end: i32) -> Result<super::Selection> {
@@ -123,6 +133,8 @@ async fn snapshot(
         selected,
         map_caret,
         caret_only: map_caret && docs_editor(conn, &parent).await,
+        context_selected: false,
+        context_selection: None,
     };
     let (chars, _, mapped_caret) = reader.node(root, None, 0).await?;
     let text = TextProxy::builder(conn)
@@ -150,6 +162,7 @@ async fn snapshot(
         chars,
         caret,
         expanded: reader.expanded,
+        selection: reader.context_selection,
     })
 }
 
@@ -216,6 +229,8 @@ struct Reader<'a> {
     selected: bool,
     map_caret: bool,
     caret_only: bool,
+    context_selected: bool,
+    context_selection: Option<(i32, i32)>,
 }
 
 impl Reader<'_> {
@@ -277,6 +292,19 @@ impl Reader<'_> {
             if raw_caret < -1 || raw_caret > n {
                 return Err("invalid caret offset".into());
             }
+            let context_range = if self.caret_only && (parent.is_none() || self.context_selected) {
+                let range = text_selection(&text).await?;
+                if parent.is_none() {
+                    self.context_selected = range.is_some();
+                }
+                if self.context_selected {
+                    Some(range.ok_or("missing embedded context selection")?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut range = if self.selected {
                 let count: i32 = text
                     .inner()
@@ -298,6 +326,21 @@ impl Reader<'_> {
             if raw.len() != n as usize {
                 return Err("text length changed during read".into());
             }
+            let mut select_child = false;
+            if let Some((start, end)) = context_range {
+                if start < 0 || end <= start || end > n {
+                    return Err("invalid embedded context selection".into());
+                }
+                if raw.get(raw_caret as usize) == Some(&'\u{fffc}') {
+                    // Docs selects an ancestor marker for a range inside its child.
+                    if (start, end) != (raw_caret, raw_caret + 1) {
+                        return Err("context selection spans embedded objects".into());
+                    }
+                    select_child = true;
+                } else if raw[start as usize..end as usize].contains(&'\u{fffc}') {
+                    return Err("selection offsets unavailable for expanded editor".into());
+                }
+            }
             // Docs exposes the whole document, including unrelated tables. Follow
             // only the caret's embedded-object chain to its current text block.
             if self.caret_only && raw_caret >= 0 && raw.get(raw_caret as usize) == Some(&'\u{fffc}')
@@ -307,8 +350,18 @@ impl Reader<'_> {
             self.chars_read += raw.len();
             let mut out = Vec::new();
             let mut caret = -1;
+            let mut selection_start = None;
+            let mut selection_end = None;
             let mut previous_block = false;
             for (offset, ch) in raw.iter().enumerate().take(range.end).skip(range.start) {
+                if let Some((start, end)) = context_range.filter(|_| !select_child) {
+                    if start == offset as i32 {
+                        selection_start = Some(out.len() as i32);
+                    }
+                    if end == offset as i32 {
+                        selection_end = Some(out.len() as i32);
+                    }
+                }
                 if *ch != '\u{fffc}' {
                     if raw_caret == offset as i32 {
                         caret = out.len() as i32;
@@ -357,8 +410,11 @@ impl Reader<'_> {
                     return Err("ambiguous embedded link".into());
                 }
                 let child = proxy.get_object(0).await.map_err(err)?;
+                let selected_context = self.context_selected;
+                self.context_selected = select_child && raw_caret == offset as i32;
                 let (chars, child_role, child_caret) =
                     self.node(&child, Some(obj), depth + 1).await?;
+                self.context_selected = selected_context;
                 let block = child_role == Role::Paragraph
                     || (self.caret_only && context_block_role(child_role));
                 if previous_block
@@ -386,8 +442,20 @@ impl Reader<'_> {
             if raw_caret == n {
                 caret = out.len() as i32;
             }
+            if let Some((_, end)) = context_range.filter(|_| !select_child) {
+                if end == n {
+                    selection_end = Some(out.len() as i32);
+                }
+                self.context_selection = Some((
+                    selection_start.ok_or("missing context selection start")?,
+                    selection_end.ok_or("missing context selection end")?,
+                ));
+            }
             if self.map_caret && text.caret_offset().await.map_err(err)? != raw_caret {
                 return Err("caret changed during read".into());
+            }
+            if context_range.is_some() && text_selection(&text).await? != context_range {
+                return Err("selection changed during read".into());
             }
             if self.selected {
                 let count: i32 = text
@@ -710,6 +778,41 @@ mod tests {
                 assert_eq!(result.after_text, "日本 already.");
                 assert!(result.selected_text.is_empty());
                 assert_eq!(unrelated_data.lock().unwrap().reads, 0);
+                // Docs reports a selected word as the ancestor's one object marker.
+                editor_data.lock().unwrap().selection = Some((1, 2));
+                parent_data.lock().unwrap().selection = Some((19, 21));
+                parent_data.lock().unwrap().caret = Some(21);
+                let selected = context(&client, &editor).await.unwrap();
+                assert_eq!(selected.before_text, "We were discussing ");
+                assert_eq!(selected.selected_text, "日本");
+                assert_eq!(selected.after_text, " already.");
+                assert_eq!(unrelated_data.lock().unwrap().reads, 0);
+                editor_data.lock().unwrap().selection = Some((0, 2));
+                assert!(context(&client, &editor).await.is_err());
+                editor_data.lock().unwrap().selection = Some((1, 2));
+                parent_data.lock().unwrap().selection = None;
+                assert!(context(&client, &editor).await.is_err());
+                parent_data.lock().unwrap().selection = Some((19, 21));
+                parent_data.lock().unwrap().change_selection = true;
+                assert!(context(&client, &editor).await.is_err());
+                parent_data.lock().unwrap().change_selection = false;
+                let (link, link_data) =
+                    fixture(&server, "/preceding_link", &parent, Role::Link, "clearly ").await;
+                link_data.lock().unwrap().start = 8;
+                parent_data.lock().unwrap().text =
+                    "We were \u{fffc}discussing 日本 already.".into();
+                parent_data.lock().unwrap().links = vec![link; 9];
+                parent_data.lock().unwrap().selection = Some((20, 22));
+                parent_data.lock().unwrap().caret = Some(22);
+                let selected = context(&client, &editor).await.unwrap();
+                assert_eq!(selected.before_text, "We were clearly discussing ");
+                assert_eq!(selected.selected_text, "日本");
+                assert_eq!(selected.after_text, " already.");
+                for range in [(20, 999), (22, 20), (20, 20)] {
+                    parent_data.lock().unwrap().selection = Some(range);
+                    assert!(context(&client, &editor).await.is_err());
+                }
+                parent_data.lock().unwrap().selection = Some((20, 22));
                 parent_data.lock().unwrap().role = Role::PasswordText;
                 assert!(context(&client, &editor).await.is_err());
             });
@@ -774,6 +877,7 @@ mod tests {
                 chars: "hello 日本 🦀\nworld".chars().collect(),
                 caret: -1,
                 expanded: true,
+                selection: None,
             }
         );
         // Chromium's root caret names the paragraph placeholder; the paragraph
