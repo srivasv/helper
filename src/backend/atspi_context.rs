@@ -157,6 +157,17 @@ mod tests {
     #[test]
     #[ignore = "requires a live editor with the caret inside a sentence"]
     fn live_mid_sentence_context() {
+        live_context(false);
+    }
+
+    #[test]
+    #[ignore = "requires a live editor with a selected word inside a sentence"]
+    fn live_selected_word_context() {
+        live_context(true);
+    }
+
+    fn live_context(has_selection: bool) {
+        let _ = env_logger::try_init();
         let title = std::env::var("WISPR_CONTEXT_TEST_WINDOW").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         start(tx, "live-context".into(), title);
@@ -174,7 +185,7 @@ mod tests {
         );
         assert!(!before.is_empty(), "missing preceding sentence");
         assert!(!after.is_empty(), "missing following sentence");
-        assert!(selected.is_empty(), "expected an insertion caret");
+        assert_eq!(!selected.is_empty(), has_selection, "unexpected selection");
         crate::proto::encode(&message).expect("context must fit the IPC frame");
     }
 
