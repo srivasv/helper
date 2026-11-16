@@ -43,6 +43,8 @@ jobs:
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test focus_discovery_boundaries -- --ignored
       - name: Test rich-text privacy and resource boundaries
         run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test rich_text_boundaries -- --ignored
+      - name: Test list-item dictation context
+        run: WISPR_EDIT_TEST_ISOLATED=1 dbus-run-session -- cargo test list_item_caret_context -- --ignored
       - name: Test Google Docs table caret context
         run: dbus-run-session -- cargo test docs_table_context -- --ignored
       - name: Test active browser tab title updates

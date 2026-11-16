@@ -762,6 +762,91 @@ mod tests {
                     .is_err(),
                     "ambiguous Chrome profiles must not supply context"
                 );
+                // Electron can expose a background window with the same title.
+                for (path, active) in [("/stale/field", false), ("/code/field", true)] {
+                    let window = server
+                        .object_server()
+                        .interface::<_, Node>(path)
+                        .await
+                        .unwrap();
+                    let mut window = window.get_mut().await;
+                    window.name = "ChatGPT".into();
+                    window.active = active;
+                }
+                let context = super::super::atspi_context::read_on_connection(
+                    &client,
+                    Some("ChatGPT"),
+                    false,
+                )
+                .await
+                .expect("the sole active ChatGPT window must supply composer context");
+                assert_eq!(context.before_text, "We were discussing ");
+                assert_eq!(context.after_text, "Linux already.");
+                for active in [true, false] {
+                    for path in ["/stale/field", "/code/field"] {
+                        let window = server
+                            .object_server()
+                            .interface::<_, Node>(path)
+                            .await
+                            .unwrap();
+                        window.get_mut().await.active = active;
+                    }
+                    assert!(
+                        super::super::atspi_context::read_on_connection(
+                            &client,
+                            Some("ChatGPT"),
+                            false,
+                        )
+                        .await
+                        .is_err(),
+                        "zero or multiple active windows must remain ambiguous"
+                    );
+                }
+                let other_app = zbus::Connection::session().await.unwrap();
+                let other_window = ObjectRef {
+                    name: other_app.unique_name().unwrap().clone(),
+                    path: "/other/window".try_into().unwrap(),
+                };
+                other_app
+                    .object_server()
+                    .at(
+                        other_window.path.clone(),
+                        Node {
+                            name: "ChatGPT".into(),
+                            class: String::new(),
+                            parent: other_window.clone(),
+                            children: vec![],
+                            focused: false,
+                            active: false,
+                            document: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                {
+                    let app = server
+                        .object_server()
+                        .interface::<_, Node>("/stale")
+                        .await
+                        .unwrap();
+                    app.get_mut().await.children = vec![other_window];
+                    let window = server
+                        .object_server()
+                        .interface::<_, Node>("/code/field")
+                        .await
+                        .unwrap();
+                    window.get_mut().await.active = true;
+                }
+                assert!(
+                    super::super::atspi_context::read_on_connection(
+                        &client,
+                        Some("ChatGPT"),
+                        false
+                    )
+                    .await
+                    .is_err(),
+                    "same-title windows from different applications must remain ambiguous"
+                );
                 assert!(selection_on_connection(&client, Some("closed window"))
                     .await
                     .unwrap()
