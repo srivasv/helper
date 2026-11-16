@@ -270,6 +270,7 @@ pub(super) async fn find_focused_field(
 ) -> Result<Option<atspi::ObjectRef>, String> {
     let root = desktop_root(conn).await?;
     let mut windows = Vec::new();
+    let mut exact_titles = true;
     for app in root.get_children().await.unwrap_or_default() {
         let Ok(app_proxy) = app.as_accessible_proxy(conn).await else {
             continue;
@@ -281,14 +282,13 @@ pub(super) async fn find_focused_field(
                 continue;
             };
             if let Some(title) = window_title {
-                if !win_proxy
-                    .name()
-                    .await
-                    .ok()
-                    .is_some_and(|name| window_title_matches(title, &name))
-                {
+                let Ok(name) = win_proxy.name().await else {
+                    continue;
+                };
+                if !window_title_matches(title, &name) {
                     continue;
                 }
+                exact_titles &= name == title;
             }
             let active = win_proxy
                 .get_state()
@@ -300,7 +300,17 @@ pub(super) async fn find_focused_field(
         }
     }
     if window_title.is_some() && windows.len() != 1 {
-        return Ok(None);
+        // Electron can expose inactive companion windows with the same title.
+        let same_app = windows
+            .first()
+            .is_some_and(|(_, first)| windows.iter().all(|(_, window)| window.name == first.name));
+        if !exact_titles || !same_app {
+            return Ok(None);
+        }
+        windows.retain(|(active, _)| *active);
+        if windows.len() != 1 {
+            return Ok(None);
+        }
     }
     search_window_groups(conn, windows, WALK_NODES).await
 }

@@ -258,7 +258,8 @@ impl Reader<'_> {
                     role,
                     Role::Paragraph | Role::Static | Role::Text | Role::Link | Role::Section
                 );
-                let context_block = self.caret_only && context_block_role(role);
+                let context_block = (self.caret_only && context_block_role(role))
+                    || (self.map_caret && matches!(role, Role::List | Role::ListItem));
                 if !text_role && !context_block {
                     return Err("unsupported embedded object".into());
                 }
@@ -416,7 +417,8 @@ impl Reader<'_> {
                     self.node(&child, Some(obj), depth + 1).await?;
                 self.context_selected = selected_context;
                 let block = child_role == Role::Paragraph
-                    || (self.caret_only && context_block_role(child_role));
+                    || (self.caret_only && context_block_role(child_role))
+                    || (self.map_caret && matches!(child_role, Role::List | Role::ListItem));
                 if previous_block
                     && block
                     && out.last() != Some(&'\n')
@@ -702,6 +704,57 @@ mod tests {
             .await
             .unwrap();
         (obj, node)
+    }
+
+    #[test]
+    #[ignore = "requires a private dbus-run-session"]
+    fn list_item_caret_context() {
+        assert_eq!(
+            std::env::var("WISPR_EDIT_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = zbus::Connection::session().await.unwrap();
+                let client = zbus::Connection::session().await.unwrap();
+                let null = ObjectRef {
+                    name: server.unique_name().unwrap().clone(),
+                    path: "/null".try_into().unwrap(),
+                };
+                let (editor, root) =
+                    fixture(&server, "/editor", &null, Role::Entry, "\u{fffc}").await;
+                root.lock().unwrap().caret = Some(0);
+                root.lock().unwrap().selection = None;
+                let (list, list_data) =
+                    fixture(&server, "/list", &editor, Role::List, "\u{fffc}\u{fffc}").await;
+                let (first, first_data) =
+                    fixture(&server, "/first", &list, Role::ListItem, "Earlier bullet.").await;
+                let (second, second_data) = fixture(
+                    &server,
+                    "/second",
+                    &list,
+                    Role::ListItem,
+                    "We were discussing 日本 already.",
+                )
+                .await;
+                root.lock().unwrap().links = vec![list];
+                list_data.lock().unwrap().links = vec![first, second];
+                list_data.lock().unwrap().caret = Some(1);
+                first_data.lock().unwrap().caret = Some(-1);
+                second_data.lock().unwrap().start = 1;
+                second_data.lock().unwrap().caret = Some(19);
+                let context = context(&client, &editor).await.unwrap();
+                assert_eq!(context.before_text, "Earlier bullet.\nWe were discussing ");
+                assert_eq!(context.after_text, "日本 already.");
+                assert!(context.selected_text.is_empty());
+                // Correction snapshots keep their existing supported-role boundary.
+                assert!(read(&client, &editor).await.is_err());
+                second_data.lock().unwrap().states.insert(State::Focusable);
+                assert!(super::context(&client, &editor).await.is_err());
+            });
     }
 
     #[test]
