@@ -35,6 +35,7 @@ const IDLE_END: Duration = Duration::from_secs(15);
 /// Never watch one paste longer than this.
 const MAX_WATCH: Duration = Duration::from_secs(120);
 const WALK_TIMEOUT: Duration = Duration::from_secs(8);
+const DISCOVERY_QUERY_TIMEOUT: Duration = Duration::from_millis(100);
 // Copilot Chat exposes its input 42 levels below the top-level window.
 const WALK_DEPTH: usize = 64;
 const WALK_NODES: usize = 6_000;
@@ -275,9 +276,14 @@ pub(super) async fn find_focused_field(
         let Ok(app_proxy) = app.as_accessible_proxy(conn).await else {
             continue;
         };
-        // Query only top-level metadata to activate lazy Chromium accessibility.
-        let _ = app_proxy.get_attributes().await;
-        for win in app_proxy.get_children().await.unwrap_or_default() {
+        // Activate lazy Chromium accessibility without waiting on stalled providers.
+        let _ = tokio::time::timeout(DISCOVERY_QUERY_TIMEOUT, app_proxy.get_attributes()).await;
+        let Ok(Ok(children)) =
+            tokio::time::timeout(DISCOVERY_QUERY_TIMEOUT, app_proxy.get_children()).await
+        else {
+            continue;
+        };
+        for win in children {
             let Ok(win_proxy) = win.as_accessible_proxy(conn).await else {
                 continue;
             };
@@ -295,7 +301,7 @@ pub(super) async fn find_focused_field(
                 .await
                 .map(|s| s.contains(State::Active))
                 .unwrap_or(false);
-            let _ = win_proxy.get_attributes().await;
+            let _ = tokio::time::timeout(DISCOVERY_QUERY_TIMEOUT, win_proxy.get_attributes()).await;
             windows.push((active, win));
         }
     }
@@ -347,8 +353,7 @@ async fn search_windows(
     if *budget > 0 {
         for window in &windows {
             if let Ok(Some(field)) =
-                tokio::time::timeout(Duration::from_millis(100), collection_focus(conn, window))
-                    .await
+                tokio::time::timeout(DISCOVERY_QUERY_TIMEOUT, collection_focus(conn, window)).await
             {
                 return Ok(Some(field));
             }
@@ -701,6 +706,87 @@ mod tests {
         }
     }
 
+    struct DiscoveryFixture {
+        children: Vec<atspi::ObjectRef>,
+        stall_queries: bool,
+    }
+
+    #[zbus::interface(name = "org.a11y.atspi.Accessible")]
+    impl DiscoveryFixture {
+        #[zbus(property)]
+        fn name(&self) -> &str {
+            "Composer"
+        }
+
+        fn get_state(&self) -> atspi::StateSet {
+            State::Active.into()
+        }
+
+        async fn get_children(&self) -> Vec<atspi::ObjectRef> {
+            if self.stall_queries && self.children.is_empty() {
+                std::future::pending().await
+            } else {
+                self.children.clone()
+            }
+        }
+
+        async fn get_attributes(&self) -> std::collections::HashMap<String, String> {
+            if self.stall_queries {
+                std::future::pending().await
+            } else {
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    async fn check_stalled_activation(
+        server: &zbus::Connection,
+        client: &zbus::Connection,
+        field: &atspi::ObjectRef,
+    ) {
+        server
+            .request_name("org.a11y.atspi.Registry")
+            .await
+            .unwrap();
+        let object = |path: &str| atspi::ObjectRef {
+            name: field.name.clone(),
+            path: path.try_into().unwrap(),
+        };
+        let stalled_app = object("/stalled_application");
+        let app = object("/composer_application");
+        let window = object("/composer_window");
+        for (path, children, stall_queries) in [
+            (
+                "/org/a11y/atspi/accessible/root",
+                vec![stalled_app, app],
+                false,
+            ),
+            ("/stalled_application", vec![], true),
+            ("/composer_application", vec![window], false),
+            ("/composer_window", vec![field.clone()], true),
+        ] {
+            server
+                .object_server()
+                .at(
+                    path,
+                    DiscoveryFixture {
+                        children,
+                        stall_queries,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let found = tokio::time::timeout(
+            Duration::from_secs(1),
+            find_focused_field(client, Some("Composer")),
+        )
+        .await
+        .expect("optional activation calls must not block focused-editor discovery")
+        .unwrap();
+        assert_eq!(found.as_ref(), Some(field));
+    }
+
     async fn check_noneditable_focus() {
         let server = zbus::Connection::session().await.unwrap();
         let client = zbus::Connection::session().await.unwrap();
@@ -798,6 +884,7 @@ mod tests {
                     .unwrap();
             }
             let target = nodes[42].clone();
+            check_stalled_activation(&server, &client, &target).await;
             assert_eq!(
                 search_windows(&client, vec![nodes[0].clone()], &mut 100)
                     .await
