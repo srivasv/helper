@@ -354,6 +354,7 @@ impl Reader<'_> {
             let mut selection_start = None;
             let mut selection_end = None;
             let mut previous_block = false;
+            let mut empty_placeholder = false;
             for (offset, ch) in raw.iter().enumerate().take(range.end).skip(range.start) {
                 if let Some((start, end)) = context_range.filter(|_| !select_child) {
                     if start == offset as i32 {
@@ -416,6 +417,28 @@ impl Reader<'_> {
                 let (chars, child_role, child_caret) =
                     self.node(&child, Some(obj), depth + 1).await?;
                 self.context_selected = selected_context;
+                if self.map_caret
+                    && !self.caret_only
+                    && matches!(role, Role::Entry | Role::Paragraph)
+                    && raw == ['\u{fffc}', '\n']
+                    && child_role == Role::Section
+                    && child_caret == -1
+                {
+                    // Chromium exposes an empty ProseMirror paragraph's CSS hint
+                    // and trailing break as Text, sometimes without a child caret.
+                    let child_acc = child.as_accessible_proxy(self.conn).await.map_err(err)?;
+                    empty_placeholder = !child_acc
+                        .get_state()
+                        .await
+                        .map_err(err)?
+                        .contains(State::Editable)
+                        && child_acc
+                            .get_attributes()
+                            .await
+                            .map_err(err)?
+                            .get("tag")
+                            .is_some_and(|tag| tag == "::before");
+                }
                 let block = child_role == Role::Paragraph
                     || (self.caret_only && context_block_role(child_role))
                     || (self.map_caret && matches!(child_role, Role::List | Role::ListItem));
@@ -486,6 +509,9 @@ impl Reader<'_> {
             } else {
                 check_root(&acc).await?;
             }
+            if empty_placeholder {
+                return Ok((Vec::new(), role, 0));
+            }
             Ok((out, role, caret))
         })
     }
@@ -515,6 +541,7 @@ mod tests {
     struct Node {
         role: Role,
         classes: String,
+        tag: String,
         parent: ObjectRef,
         states: atspi::StateSet,
         text: String,
@@ -539,10 +566,11 @@ mod tests {
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl Accessible {
         fn get_attributes(&self) -> std::collections::HashMap<String, String> {
-            std::collections::HashMap::from([(
-                "class".into(),
-                self.0.lock().unwrap().classes.clone(),
-            )])
+            let node = self.0.lock().unwrap();
+            std::collections::HashMap::from([
+                ("class".into(), node.classes.clone()),
+                ("tag".into(), node.tag.clone()),
+            ])
         }
         fn get_role(&self) -> Role {
             self.0.lock().unwrap().role
@@ -660,6 +688,7 @@ mod tests {
         let node = Arc::new(Mutex::new(Node {
             role,
             classes: String::new(),
+            tag: String::new(),
             parent: parent.clone(),
             states: if role == Role::Entry {
                 {
@@ -1147,6 +1176,58 @@ mod tests {
         assert_eq!(read(&client, &root).await.unwrap().caret, 7);
     }
 
+    async fn empty_composer_context() {
+        let server = zbus::Connection::session().await.unwrap();
+        let client = zbus::Connection::session().await.unwrap();
+        let null = ObjectRef {
+            name: server.unique_name().unwrap().clone(),
+            path: "/null".try_into().unwrap(),
+        };
+        let (editor, root) = fixture(&server, "/composer", &null, Role::Entry, "\u{fffc}").await;
+        let (paragraph, paragraph_data) = fixture(
+            &server,
+            "/composer_paragraph",
+            &editor,
+            Role::Paragraph,
+            "\u{fffc}\n",
+        )
+        .await;
+        let (hint, hint_data) = fixture(
+            &server,
+            "/composer_hint",
+            &paragraph,
+            Role::Section,
+            "Composer hint",
+        )
+        .await;
+        {
+            let mut root = root.lock().unwrap();
+            root.links = vec![paragraph];
+            root.selection = None;
+            root.caret = Some(0);
+        }
+        {
+            let mut hint = hint_data.lock().unwrap();
+            hint.tag = "::before".into();
+            hint.caret = Some(-1);
+            hint.states = atspi::StateSet::empty();
+        }
+        paragraph_data.lock().unwrap().links = vec![hint];
+        for caret in [-1, 0, 1, 2] {
+            paragraph_data.lock().unwrap().caret = Some(caret);
+            let result = context(&client, &editor).await.unwrap();
+            assert!(
+                result.contents.is_empty(),
+                "placeholder leaked at caret {caret}"
+            );
+        }
+
+        // Missing caret in a real paragraph must still fail closed.
+        hint_data.lock().unwrap().tag.clear();
+        paragraph_data.lock().unwrap().caret = Some(-1);
+        assert!(context(&client, &editor).await.is_err());
+    }
+
     #[test]
     #[ignore = "requires a private dbus-run-session"]
     fn rich_text_boundaries() {
@@ -1158,6 +1239,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(checks());
+            .block_on(async {
+                empty_composer_context().await;
+                checks().await;
+            });
     }
 }
