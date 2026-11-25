@@ -293,19 +293,6 @@ impl Reader<'_> {
             if raw_caret < -1 || raw_caret > n {
                 return Err("invalid caret offset".into());
             }
-            let context_range = if self.caret_only && (parent.is_none() || self.context_selected) {
-                let range = text_selection(&text).await?;
-                if parent.is_none() {
-                    self.context_selected = range.is_some();
-                }
-                if self.context_selected {
-                    Some(range.ok_or("missing embedded context selection")?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             let mut range = if self.selected {
                 let count: i32 = text
                     .inner()
@@ -327,13 +314,27 @@ impl Reader<'_> {
             if raw.len() != n as usize {
                 return Err("text length changed during read".into());
             }
+            let context_range = if self.context_selected {
+                Some(
+                    text_selection(&text)
+                        .await?
+                        .ok_or("missing embedded context selection")?,
+                )
+            } else if self.map_caret
+                && parent.is_none()
+                && (self.caret_only || raw.contains(&'\u{fffc}'))
+            {
+                text_selection(&text).await?
+            } else {
+                None
+            };
             let mut select_child = false;
             if let Some((start, end)) = context_range {
                 if start < 0 || end <= start || end > n {
                     return Err("invalid embedded context selection".into());
                 }
                 if raw.get(raw_caret as usize) == Some(&'\u{fffc}') {
-                    // Docs selects an ancestor marker for a range inside its child.
+                    // Chromium selects an ancestor marker for a range inside its child.
                     if (start, end) != (raw_caret, raw_caret + 1) {
                         return Err("context selection spans embedded objects".into());
                     }
@@ -451,6 +452,11 @@ impl Reader<'_> {
                 }
                 if raw_caret == offset as i32 && child_caret >= 0 {
                     caret = out.len() as i32 + child_caret;
+                }
+                if select_child && raw_caret == offset as i32 {
+                    let (start, end) = self.context_selection.ok_or("missing child selection")?;
+                    let base = out.len() as i32;
+                    self.context_selection = Some((base + start, base + end));
                 }
                 out.extend(chars);
                 previous_block = block;
@@ -977,6 +983,17 @@ mod tests {
         let middle = context(&client, &root).await.unwrap();
         assert_eq!(middle.before_text, "hello 日本 🦀\nwo");
         assert_eq!(middle.after_text, "rld");
+        // Chromium reports a selected paragraph marker at the root and the
+        // actual character range inside the paragraph.
+        r.lock().unwrap().selection = Some((1, 2));
+        b.lock().unwrap().selection = Some((1, 2));
+        let selected = context(&client, &root).await.unwrap();
+        assert_eq!(selected.before_text, "hello 日本 🦀\nw");
+        assert_eq!(selected.selected_text, "o");
+        assert_eq!(selected.after_text, "rld");
+        r.lock().unwrap().selection = Some((0, 2));
+        assert!(context(&client, &root).await.is_err());
+        r.lock().unwrap().selection = None;
         r.lock().unwrap().caret = Some(0);
         a.lock().unwrap().caret = Some(6);
         b.lock().unwrap().caret = Some(-1);
@@ -1002,9 +1019,10 @@ mod tests {
         a.lock().unwrap().move_caret = false;
         a.lock().unwrap().caret = Some(6);
         r.lock().unwrap().selection = Some((0, 1));
+        a.lock().unwrap().selection = None;
         assert!(
             context(&client, &root).await.is_err(),
-            "unmapped rich selection"
+            "missing paragraph selection"
         );
         let (span, span_data) =
             fixture(&server, "/caret_span", &p1, Role::Text, "hello 日本 🦀").await;
